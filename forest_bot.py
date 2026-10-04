@@ -266,6 +266,10 @@ def init_db():
         )
         """
     )
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN forest_username TEXT")
+    except sqlite3.OperationalError:
+        pass  # already added by a previous startup — ALTER TABLE has no IF NOT EXISTS in SQLite
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS hall_of_fame (
@@ -300,6 +304,15 @@ def init_db():
             weekday INTEGER PRIMARY KEY,
             start_time TEXT,
             end_time TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS strikes (
+            user_id INTEGER PRIMARY KEY,
+            count INTEGER DEFAULT 0,
+            last_strike_at TEXT
         )
         """
     )
@@ -1368,6 +1381,284 @@ async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+STRIKE_MESSAGES = {
+    1: "⚠️ تنبيه لـ {name}: يرجى الانتباه خلال جلسات Plant Together — خروجك من الجلسة يفشّل الشجرة للجميع.",
+    2: "⚠️⚠️ تنبيه ثانٍ لـ {name}: نفس الموضوع تكرر. يرجى الحرص أكثر بجلسات المذاكرة الجماعية.",
+    3: "🚨 تنبيه أخير لـ {name}: هذا التنبيه الثالث. تكرار الموضوع راح يأثر على مشاركتك بالجلسات الجماعية.",
+}
+
+
+def find_users_by_name(name: str):
+    """Case-insensitive partial match against EITHER registered
+    display_name (Telegram) OR self-declared forest_username. The
+    Forest-username match is honor-system only — nothing verifies it
+    against Forest's actual data, since Forest has no public API at all.
+    It's still useful: once someone self-declares it via /setforestname,
+    an admin identifying them by their Forest name (e.g. from a
+    screenshot) can resolve straight to their real Telegram account."""
+    conn = db()
+    name_clean = name.strip().lstrip("@").lower()
+    rows = conn.execute(
+        "SELECT user_id, display_name, forest_username FROM users "
+        "WHERE LOWER(display_name) LIKE ? OR LOWER(COALESCE(forest_username, '')) LIKE ?",
+        (f"%{name_clean}%", f"%{name_clean}%"),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def set_forest_username(user_id: int, forest_username: str):
+    conn = db()
+    conn.execute("UPDATE users SET forest_username=? WHERE user_id=?", (forest_username, user_id))
+    conn.commit()
+    conn.close()
+
+
+async def cmd_setforestname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setforestname <username> — self-service, any registered user can
+    declare their own Forest app username. Purely self-reported — the
+    bot has no way to verify this against Forest's actual data (no
+    public API exists). Still useful: lets admins resolve a Forest
+    username spotted in a screenshot back to the right Telegram account
+    for things like /strike."""
+    user = update.effective_user
+    if not get_user(user.id):
+        await update.message.reply_text("سجّل نفسك أولًا: /register Med25")
+        return
+    if not context.args:
+        await update.message.reply_text("استخدم: /setforestname اسمك_بتطبيق_Forest")
+        return
+    forest_name = " ".join(context.args)
+    set_forest_username(user.id, forest_name)
+    await update.message.reply_text(
+        f"✅ تم ربط يوزرنيم Forest «{forest_name}» بحسابك. "
+        "ملاحظة: هذا بناءً على كلامك فقط — ما فيه طريقة نتأكد منه تقنيًا، بس يفيد لو احتجنا نربط اسمك بأي شي."
+    )
+
+
+def get_strike_count(user_id: int) -> int:
+    conn = db()
+    row = conn.execute("SELECT count FROM strikes WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return row["count"] if row else 0
+
+
+def add_strike(user_id: int) -> int:
+    conn = db()
+    conn.execute(
+        "INSERT INTO strikes (user_id, count, last_strike_at) VALUES (?, 1, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET count = count + 1, last_strike_at = excluded.last_strike_at",
+        (user_id, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    row = conn.execute("SELECT count FROM strikes WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return row["count"]
+
+
+async def cmd_strike(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/strike — manager-only. Two ways to target someone: reply to
+    their message, OR type /strike <name> to look them up by their
+    registered display_name (the bot has no connection to Forest's
+    identities — this only works if the name you know happens to match
+    what they registered under on Telegram). Strikes 1-3 post an
+    escalating public warning in the sessions topic. Strike 4+
+    deliberately does NOT auto-punish anyone — it alerts managers
+    privately instead, so a human decides what happens next rather than
+    the bot silently restricting someone based on one admin's account of
+    what happened."""
+    user = update.effective_user
+    if not MANAGER_IDS or user.id not in MANAGER_IDS:
+        await update.message.reply_text("هذا الأمر مخصص للمنظّمين فقط.")
+        return
+
+    target_id = None
+    name = None
+
+    if update.message.reply_to_message:
+        t = update.message.reply_to_message.from_user
+        target_id, name = t.id, t.first_name
+    elif context.args:
+        query = " ".join(context.args)
+        matches = find_users_by_name(query)
+        if not matches:
+            await update.message.reply_text(
+                f"ما لقيت أحد مسجّل باسم قريب من «{query}».\n"
+                "البوت ما يعرف أسماء Forest — بس الاسم المسجّل بالبوت (يوزرنيم تيليجرام عادةً). "
+                "تأكد إن الشخص مسجّل أصلًا (/register)، أو جرّب اسم ثاني، أو رد على رسالة له لو متوفرة."
+            )
+            return
+        if len(matches) > 1:
+            names = "\n".join(f"- {m['display_name']}" for m in matches)
+            await update.message.reply_text(f"لقيت أكثر من واحد يطابق:\n{names}\nحدد الاسم بالضبط.")
+            return
+        target_id, name = matches[0]["user_id"], matches[0]["display_name"]
+    else:
+        await update.message.reply_text(
+            "استخدم: رد على رسالة الشخص بـ /strike، أو اكتب /strike اسمه (لازم يكون مسجّل بالبوت)."
+        )
+        return
+
+    count = add_strike(target_id)
+
+    if count in STRIKE_MESSAGES:
+        text = STRIKE_MESSAGES[count].format(name=name)
+        if GROUP_CHAT_ID:
+            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text, **_topic_kwargs(TOPIC_SESSIONS_ID))
+    elif count >= 4:
+        for mid in MANAGER_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=mid,
+                    text=(
+                        f"🚨 {name} وصل {count} تنبيهات بجلسات Plant Together.\n"
+                        "القرار يرجع لكم — البوت ما يقدر يقيّد أحد تلقائيًا."
+                    ),
+                )
+            except Exception:
+                logger.info(f"Could not DM strike alert to manager {mid}")
+
+    await update.message.reply_text(f"✅ تم تسجيل تنبيه رقم {count} لـ {name}.")
+
+
+async def cmd_blockmember(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/blockmember — manager-only, explicit real moderation action.
+    Reply to someone's message, or type /blockmember <name> to resolve
+    via display_name or self-declared forest_username. Mutes them group-
+    wide using Telegram's own restriction API (can still read, can't
+    send) — Telegram's Bot API doesn't support muting in just one topic,
+    only the whole group. This is DELIBERATELY never automatic, even at
+    high strike counts — always a conscious command a manager types."""
+    user = update.effective_user
+    if not MANAGER_IDS or user.id not in MANAGER_IDS:
+        await update.message.reply_text("هذا الأمر مخصص للمنظّمين فقط.")
+        return
+    if not GROUP_CHAT_ID:
+        await update.message.reply_text("ما فيه GROUP_CHAT_ID معرّف.")
+        return
+
+    target_id = None
+    name = None
+    if update.message.reply_to_message:
+        t = update.message.reply_to_message.from_user
+        target_id, name = t.id, t.first_name
+    elif context.args:
+        query = " ".join(context.args)
+        matches = find_users_by_name(query)
+        if not matches:
+            await update.message.reply_text(f"ما لقيت أحد مسجّل باسم قريب من «{query}».")
+            return
+        if len(matches) > 1:
+            names = "\n".join(f"- {m['display_name']}" for m in matches)
+            await update.message.reply_text(f"لقيت أكثر من واحد يطابق:\n{names}\nحدد الاسم بالضبط.")
+            return
+        target_id, name = matches[0]["user_id"], matches[0]["display_name"]
+    else:
+        await update.message.reply_text("استخدم: رد على رسالة الشخص بـ /blockmember، أو اكتب /blockmember اسمه.")
+        return
+
+    try:
+        from telegram import ChatPermissions
+        await context.bot.restrict_chat_member(
+            chat_id=GROUP_CHAT_ID,
+            user_id=target_id,
+            permissions=ChatPermissions(can_send_messages=False),
+        )
+        await update.message.reply_text(
+            f"🔇 تم كتم {name} بالقروب كامل (ملاحظة: تيليجرام ما يدعم الكتم بروم واحد بس، يكتم بالقروب كله). "
+            "يُرفع الكتم بالأمر /unblockmember."
+        )
+    except Exception:
+        logger.exception("Failed to restrict chat member")
+        await update.message.reply_text(
+            "⚠️ ما قدرت أكتمه — تأكد إن البوت أدمن بالقروب وله صلاحية تقييد الأعضاء."
+        )
+
+
+async def cmd_unblockmember(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unblockmember — manager-only. Reverses /blockmember."""
+    user = update.effective_user
+    if not MANAGER_IDS or user.id not in MANAGER_IDS:
+        await update.message.reply_text("هذا الأمر مخصص للمنظّمين فقط.")
+        return
+    if not GROUP_CHAT_ID:
+        await update.message.reply_text("ما فيه GROUP_CHAT_ID معرّف.")
+        return
+
+    target_id = None
+    name = None
+    if update.message.reply_to_message:
+        t = update.message.reply_to_message.from_user
+        target_id, name = t.id, t.first_name
+    elif context.args:
+        query = " ".join(context.args)
+        matches = find_users_by_name(query)
+        if not matches:
+            await update.message.reply_text(f"ما لقيت أحد مسجّل باسم قريب من «{query}».")
+            return
+        if len(matches) > 1:
+            names = "\n".join(f"- {m['display_name']}" for m in matches)
+            await update.message.reply_text(f"لقيت أكثر من واحد يطابق:\n{names}\nحدد الاسم بالضبط.")
+            return
+        target_id, name = matches[0]["user_id"], matches[0]["display_name"]
+    else:
+        await update.message.reply_text("استخدم: رد على رسالة الشخص بـ /unblockmember، أو اكتب /unblockmember اسمه.")
+        return
+
+    try:
+        from telegram import ChatPermissions
+        await context.bot.restrict_chat_member(
+            chat_id=GROUP_CHAT_ID,
+            user_id=target_id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+            ),
+        )
+        await update.message.reply_text(f"🔊 تم رفع الكتم عن {name}.")
+    except Exception:
+        logger.exception("Failed to unrestrict chat member")
+        await update.message.reply_text("⚠️ ما قدرت أرفع الكتم.")
+
+
+async def cmd_strikes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/strikes — manager-only. Reply to someone's message, or type
+    /strikes <name>, to check their current count without adding one."""
+    user = update.effective_user
+    if not MANAGER_IDS or user.id not in MANAGER_IDS:
+        await update.message.reply_text("هذا الأمر مخصص للمنظّمين فقط.")
+        return
+
+    if update.message.reply_to_message:
+        t = update.message.reply_to_message.from_user
+        target_id, name = t.id, t.first_name
+    elif context.args:
+        query = " ".join(context.args)
+        matches = find_users_by_name(query)
+        if not matches:
+            await update.message.reply_text(f"ما لقيت أحد مسجّل باسم قريب من «{query}».")
+            return
+        if len(matches) > 1:
+            names = "\n".join(f"- {m['display_name']}" for m in matches)
+            await update.message.reply_text(f"لقيت أكثر من واحد يطابق:\n{names}\nحدد الاسم بالضبط.")
+            return
+        target_id, name = matches[0]["user_id"], matches[0]["display_name"]
+    else:
+        await update.message.reply_text("رد على رسالة الشخص، أو اكتب /strikes اسمه.")
+        return
+
+    count = get_strike_count(target_id)
+    await update.message.reply_text(f"📋 {name}: {count} تنبيه/تنبيهات مسجّلة.")
+
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     total = total_minutes(user.id)
@@ -2153,8 +2444,11 @@ async def cmd_nextsession(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def job_check_schedule_pings(context: ContextTypes.DEFAULT_TYPE):
-    """Runs every 5 minutes; fires one short reminder at the start of each
-    scheduled block from today's posted schedule."""
+    """Runs every 5 minutes; fires one short heads-up 5 minutes BEFORE
+    each scheduled block starts — not at the start itself. A ping at the
+    start is redundant when an admin already shared the link ahead of
+    time (the normal case); a heads-up beforehand is what's actually
+    useful, whether or not a link's already out."""
     if not GROUP_CHAT_ID:
         return
     if get_setting("schedule_posting_enabled", "false") != "true":
@@ -2164,13 +2458,14 @@ async def job_check_schedule_pings(context: ContextTypes.DEFAULT_TYPE):
         return
     now = local_now()
     for start, end in sched["blocks"]:
-        if start <= now < start + timedelta(minutes=5) and start not in sched["pinged"]:
+        ping_time = start - timedelta(minutes=5)
+        if ping_time <= now < start and start not in sched["pinged"]:
             sched["pinged"].add(start)
             await context.bot.send_message(
                 chat_id=GROUP_CHAT_ID,
                 text=(
-                    f"⏰ بدأت فترة مذاكرة ({start.strftime('%I:%M %p')} – {end.strftime('%I:%M %p')})\n"
-                    "من الأدمنز الحين؟ سوّي Plant Together بـ Forest وابعث الرابط 🌲"
+                    f"🌲 تبدأ فترة مذاكرة بعد ٥ دقايق ({start.strftime('%I:%M %p')} – {end.strftime('%I:%M %p')})\n"
+                    "لو ما فيه رابط بعد، أحد الأدمنز يبدأ Plant Together ويشاركه هنا."
                 ),
                 **_topic_kwargs(TOPIC_SESSIONS_ID),
             )
@@ -2362,6 +2657,11 @@ def main():
     app.add_handler(CommandHandler("exammode", cmd_exammode))
     app.add_handler(CommandHandler("findpartner", cmd_findpartner))
     app.add_handler(CommandHandler("log", cmd_log))
+    app.add_handler(CommandHandler("strike", cmd_strike))
+    app.add_handler(CommandHandler("strikes", cmd_strikes))
+    app.add_handler(CommandHandler("setforestname", cmd_setforestname))
+    app.add_handler(CommandHandler("blockmember", cmd_blockmember))
+    app.add_handler(CommandHandler("unblockmember", cmd_unblockmember))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("nextsession", cmd_nextsession))
     app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
