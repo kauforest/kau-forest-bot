@@ -1055,12 +1055,83 @@ async def cmd_setcollegehours(update: Update, context: ContextTypes.DEFAULT_TYPE
 DONE_KEYWORDS = {"تم", "تمت", "خلص", "خلصت", "done", "Done", "DONE"}
 
 
+def _save_schedule_state(sched: dict):
+    """Persists the schedule state to the database — bot_data alone is
+    in-memory only and gets wiped on every redeploy. Given how often this
+    bot has redeployed, relying on memory for this silently breaks 'تم',
+    link-detection, and /nextsession after any restart without any error
+    showing anywhere — this is what actually makes those survive one."""
+    try:
+        serializable = {
+            "date": sched["date"],
+            "blocks": [[s.isoformat(), e.isoformat()] for s, e in sched["blocks"]],
+            "gap_labels": {str(k): v for k, v in sched.get("gap_labels", {}).items()},
+            "pinged": list(sched.get("pinged", set())),
+            "done": list(sched.get("done", set())),
+            "link_sent": list(sched.get("link_sent", set())),
+        }
+        set_setting("today_schedule_state", json.dumps(serializable, ensure_ascii=False))
+    except Exception:
+        logger.exception("Failed to persist today's schedule state")
+
+
+def _load_schedule_state() -> dict | None:
+    raw = get_setting("today_schedule_state")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        blocks = [(datetime.fromisoformat(s), datetime.fromisoformat(e)) for s, e in data["blocks"]]
+        return {
+            "date": data["date"],
+            "blocks": blocks,
+            "gap_labels": {int(k): v for k, v in data.get("gap_labels", {}).items()},
+            "pinged": set(data.get("pinged", [])),
+            "done": set(data.get("done", [])),
+            "link_sent": set(data.get("link_sent", [])),
+        }
+    except Exception:
+        logger.exception("Failed to load persisted schedule state")
+        return None
+
+
+def _get_today_schedule(context) -> dict | None:
+    """Prefers the fast in-memory cache, but transparently falls back to
+    the database if the process restarted since the schedule was last
+    touched — the whole point of this being persisted at all."""
+    sched = context.application.bot_data.get("today_schedule")
+    if sched and sched.get("date") == local_today().isoformat():
+        return sched
+    loaded = _load_schedule_state()
+    if loaded and loaded["date"] == local_today().isoformat():
+        context.application.bot_data["today_schedule"] = loaded
+        return loaded
+    return None
+
+
+def _get_pinned_schedule_message_id(context):
+    msg_id = context.application.bot_data.get("pinned_schedule_message_id")
+    if msg_id:
+        return msg_id
+    stored = get_setting("pinned_schedule_message_id")
+    if stored:
+        msg_id = int(stored)
+        context.application.bot_data["pinned_schedule_message_id"] = msg_id
+        return msg_id
+    return None
+
+
+def _set_pinned_schedule_message_id(context, msg_id: int):
+    context.application.bot_data["pinned_schedule_message_id"] = msg_id
+    set_setting("pinned_schedule_message_id", str(msg_id))
+
+
 async def _refresh_pinned_schedule(context):
     """Re-renders and re-saves the pinned schedule message in place —
     shared by the manual 'تم' handler and the automatic link-based
     completion job below, so both stay in sync the same way."""
-    sched = context.application.bot_data.get("today_schedule")
-    msg_id = context.application.bot_data.get("pinned_schedule_message_id")
+    sched = _get_today_schedule(context)
+    msg_id = _get_pinned_schedule_message_id(context)
     if not sched or not msg_id or not GROUP_CHAT_ID:
         return
     try:
@@ -1084,13 +1155,17 @@ async def handle_session_done(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     if MANAGER_IDS and user.id not in MANAGER_IDS:
         return
-    if update.message.text.strip() not in DONE_KEYWORDS:
+    # Tolerant of trailing punctuation/emoji ("Done!", "تم ✅") — still
+    # requires the keyword to be the whole message, not buried in a
+    # sentence, so it can't misfire on unrelated chat.
+    cleaned = update.message.text.strip().rstrip("!.؟? \t").strip("✅👍🔥🌲 ")
+    if cleaned not in DONE_KEYWORDS:
         return
     if TOPIC_SESSIONS_ID and str(getattr(update.message, "message_thread_id", "")) != str(TOPIC_SESSIONS_ID):
         return
 
-    sched = context.application.bot_data.get("today_schedule")
-    if not sched or sched["date"] != local_today().isoformat():
+    sched = _get_today_schedule(context)
+    if not sched:
         return
 
     now = local_now()
@@ -1103,6 +1178,7 @@ async def handle_session_done(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     start, end = max(candidates, key=lambda b: b[0])
     done_set.add(start.isoformat())
+    _save_schedule_state(sched)
     await _refresh_pinned_schedule(context)
 
 
@@ -1126,8 +1202,8 @@ async def handle_session_link(update: Update, context: ContextTypes.DEFAULT_TYPE
     if TOPIC_SESSIONS_ID and str(getattr(update.message, "message_thread_id", "")) != str(TOPIC_SESSIONS_ID):
         return
 
-    sched = context.application.bot_data.get("today_schedule")
-    if not sched or sched["date"] != local_today().isoformat():
+    sched = _get_today_schedule(context)
+    if not sched:
         return
 
     now = local_now()
@@ -1135,6 +1211,7 @@ async def handle_session_link(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not active:
         return
     sched.setdefault("link_sent", set()).add(active[0].isoformat())
+    _save_schedule_state(sched)
 
 
 async def job_auto_complete_sessions(context: ContextTypes.DEFAULT_TYPE):
@@ -1142,8 +1219,8 @@ async def job_auto_complete_sessions(context: ContextTypes.DEFAULT_TYPE):
     just ended, that had a link sent during it, and isn't already marked
     done, gets auto-checkmarked — no manual 'تم' needed for the common
     case where a link genuinely went out."""
-    sched = context.application.bot_data.get("today_schedule")
-    if not sched or sched["date"] != local_today().isoformat():
+    sched = _get_today_schedule(context)
+    if not sched:
         return
     now = local_now()
     link_sent = sched.get("link_sent", set())
@@ -1155,6 +1232,7 @@ async def job_auto_complete_sessions(context: ContextTypes.DEFAULT_TYPE):
             done_set.add(key)
             changed = True
     if changed:
+        _save_schedule_state(sched)
         await _refresh_pinned_schedule(context)
 
 
@@ -2373,6 +2451,7 @@ async def job_post_daily_schedule(context: ContextTypes.DEFAULT_TYPE):
         "done": set(),
     }
     context.application.bot_data["today_schedule"] = sched
+    _save_schedule_state(sched)
     if not blocks:
         return
 
@@ -2405,7 +2484,7 @@ async def job_post_daily_schedule(context: ContextTypes.DEFAULT_TYPE):
     # stale/invalid old message_id (e.g. from before a group migrated to
     # a supergroup) must never block pinning today's message or updating
     # which message_id is "current" below.
-    old_message_id = context.application.bot_data.get("pinned_schedule_message_id")
+    old_message_id = _get_pinned_schedule_message_id(context)
     if old_message_id:
         try:
             await context.bot.unpin_chat_message(chat_id=GROUP_CHAT_ID, message_id=old_message_id)
@@ -2421,14 +2500,14 @@ async def job_post_daily_schedule(context: ContextTypes.DEFAULT_TYPE):
 
     # Always update this, pin succeeded or not — the "تم" done-marking
     # feature needs to know which message is current regardless.
-    context.application.bot_data["pinned_schedule_message_id"] = msg.message_id
+    _set_pinned_schedule_message_id(context, msg.message_id)
 
 
 async def cmd_nextsession(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/nextsession — shows the next upcoming study block without needing
     to scroll back up to the pinned morning post."""
-    sched = context.application.bot_data.get("today_schedule")
-    if not sched or sched["date"] != local_today().isoformat():
+    sched = _get_today_schedule(context)
+    if not sched:
         await update.message.reply_text("ما فيه جدول لليوم بعد — ينشر كل يوم الساعة 12:05 صباحًا.")
         return
     now = local_now()
@@ -2453,14 +2532,16 @@ async def job_check_schedule_pings(context: ContextTypes.DEFAULT_TYPE):
         return
     if get_setting("schedule_posting_enabled", "false") != "true":
         return  # same kill-switch as the morning post — stay quiet in the group until enabled
-    sched = context.application.bot_data.get("today_schedule")
-    if not sched or sched["date"] != local_today().isoformat():
+    sched = _get_today_schedule(context)
+    if not sched:
         return
     now = local_now()
+    changed = False
     for start, end in sched["blocks"]:
         ping_time = start - timedelta(minutes=5)
-        if ping_time <= now < start and start not in sched["pinged"]:
-            sched["pinged"].add(start)
+        if ping_time <= now < start and start.isoformat() not in sched["pinged"]:
+            sched["pinged"].add(start.isoformat())  # string, not datetime — keeps it JSON-serializable
+            changed = True
             await context.bot.send_message(
                 chat_id=GROUP_CHAT_ID,
                 text=(
@@ -2469,6 +2550,8 @@ async def job_check_schedule_pings(context: ContextTypes.DEFAULT_TYPE):
                 ),
                 **_topic_kwargs(TOPIC_SESSIONS_ID),
             )
+    if changed:
+        _save_schedule_state(sched)
 
 
 DAILY_POLL_QUESTION = "⏱️ كم ساعة ذاكرت اليوم؟"
