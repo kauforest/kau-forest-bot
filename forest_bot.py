@@ -693,9 +693,11 @@ async def check_and_announce_streak_milestones(update, context, user):
                 )
                 conn.commit()
                 if GROUP_CHAT_ID:
+                    registered = get_user(user.id)
+                    public_name = registered["display_name"] if registered else user.first_name
                     await context.bot.send_message(
                         chat_id=GROUP_CHAT_ID,
-                        text=f"{STREAK_LABELS[m]}\n{user.first_name} مستمر بدون انقطاع!",
+                        text=f"{STREAK_LABELS[m]}\n{public_name} مستمر بدون انقطاع!",
                         **_topic_kwargs(TOPIC_ACHIEVEMENTS_ID),
                     )
     conn.close()
@@ -715,9 +717,11 @@ async def check_and_announce_level_up(update, context, user):
         conn.commit()
         title = level_title_for(level)
         if GROUP_CHAT_ID:
+            registered = get_user(user.id)
+            public_name = registered["display_name"] if registered else user.first_name
             await context.bot.send_message(
                 chat_id=GROUP_CHAT_ID,
-                text=f"⭐ ترقية! {user.first_name} صار بالمستوى {level} — {title}",
+                text=f"⭐ ترقية! {public_name} صار بالمستوى {level} — {title}",
                 **_topic_kwargs(TOPIC_ACHIEVEMENTS_ID),
             )
     conn.close()
@@ -1447,7 +1451,8 @@ async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     target = update.message.reply_to_message.from_user
     minutes = int(args[0])
-    if not get_user(target.id):
+    target_registered = get_user(target.id)
+    if not target_registered:
         await update.message.reply_text("هذا الشخص ما سجّل نفسه بعد.")
         return
 
@@ -1455,7 +1460,7 @@ async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     push_leaderboard_to_github()
     await broadcast_update()
     await update.message.reply_text(
-        f"✅ تم تسجيل {minutes} دقيقة يدويًا لـ {target.first_name} (تصحيح من المنظم)."
+        f"✅ تم تسجيل {minutes} دقيقة يدويًا لـ {target_registered['display_name']} (تصحيح من المنظم)."
     )
 
 
@@ -1770,8 +1775,10 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if 0 < daily_gap <= 30:
             daily_gap_line = f"\n🔥 بس {daily_gap} دقيقة وتكون الأول اليوم!"
 
+    stats_registered = get_user(user.id)
+    stats_display_name = stats_registered["display_name"] if stats_registered else user.first_name
     await update.message.reply_text(
-        f"📊 إحصائياتك يا {user.first_name}:\n"
+        f"📊 إحصائياتك يا {stats_display_name}:\n"
         f"— المستوى {level} · {title}\n"
         f"— الإجمالي: {total} دقيقة ({total // 60} ساعة) — {xp} XP\n"
         f"— التتابع الحالي: {streak} يوم\n"
@@ -1816,9 +1823,11 @@ async def check_and_announce_milestones(update, context, user):
                 )
                 conn.commit()
                 if GROUP_CHAT_ID:
+                    registered = get_user(user.id)
+                    public_name = registered["display_name"] if registered else user.first_name
                     await context.bot.send_message(
                         chat_id=GROUP_CHAT_ID,
-                        text=f"🎉 مبروك لـ {user.first_name}!\n{MILESTONE_LABELS[m]}",
+                        text=f"🎉 مبروك لـ {public_name}!\n{MILESTONE_LABELS[m]}",
                         **_topic_kwargs(TOPIC_ACHIEVEMENTS_ID),
                     )
     conn.close()
