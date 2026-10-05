@@ -458,6 +458,16 @@ def local_now() -> datetime:
     return datetime.utcnow() + timedelta(hours=TZ_OFFSET_HOURS)
 
 
+def week_start_for(d: date) -> date:
+    """Most recent Sunday on/before d — matches the Saudi week (weekend
+    Fri/Sat, work week Sun-Thu) and the weekly leaderboard's actual
+    Saturday-night reset. Python's own weekday() is Monday-start (ISO),
+    which does NOT match this — using it directly silently resets 'this
+    week' a day early (Monday) instead of Sunday, which is exactly what
+    made real, already-logged data vanish from the weekly view."""
+    return d - timedelta(days=(d.weekday() + 1) % 7)
+
+
 def log_session(user_id: int, username: str, minutes: int, tag: str | None):
     """A single Forest-session entry (Timeline screenshot). Multiple of
     these on the same day ADD UP — unless a daily_card entry exists for
@@ -783,7 +793,7 @@ def batch_averages(since_date: date):
 
 def build_export_data() -> dict:
     today = local_today()
-    week_start = today - timedelta(days=today.weekday())
+    week_start = week_start_for(today)
     month_start = today.replace(day=1)
     epoch = date(2000, 1, 1)
 
@@ -1767,7 +1777,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Gap to this week's #1 — a concrete number to chase is usually more
     # motivating than an abstract rank number.
-    week_start = local_today() - timedelta(days=local_today().weekday())
+    week_start = week_start_for(local_today())
     week_rows = leaderboard(week_start, limit=1000)
     gap_line = ""
     if week_rows:
@@ -1804,7 +1814,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/leaderboard or /leaderboard Med25 for a single batch"""
-    week_start = local_today() - timedelta(days=local_today().weekday())
+    week_start = week_start_for(local_today())
     batch_filter = context.args[0] if context.args else None
     rows = leaderboard(week_start, batch=batch_filter)
     if not rows:
@@ -2637,7 +2647,7 @@ async def job_weekly_personal_recap(context: ContextTypes.DEFAULT_TYPE):
     personal nudge even if they didn't crack the top of the group message.
     Runs Sunday morning, after Saturday night's public leaderboard."""
     today = local_today()
-    this_week_start = today - timedelta(days=today.weekday())
+    this_week_start = week_start_for(today)
     last_week_start = this_week_start - timedelta(days=7)
 
     rows = leaderboard(last_week_start, limit=10000)
@@ -2680,7 +2690,7 @@ async def job_weekly_leaderboard(context: ContextTypes.DEFAULT_TYPE):
     if not GROUP_CHAT_ID:
         return
     today = local_today()
-    week_start = today - timedelta(days=today.weekday())
+    week_start = week_start_for(today)
     last_week_start = week_start - timedelta(days=7)
 
     rows = leaderboard(week_start)
