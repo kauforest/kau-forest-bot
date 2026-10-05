@@ -93,6 +93,37 @@
     display: block;
     margin: 0 auto 22px;
     width: fit-content;
+    max-width: 92%;
+  }
+
+  /* The daily-top banner holds 3 names + medals, not one short line —
+     a full pill shape reads as cramped at that length. A softer-cornered
+     card, with each entry able to wrap onto its own visual unit, reads
+     much more cleanly at this length. */
+  .daily-top-banner {
+    text-align: center;
+    font-size: 0.85rem;
+    color: var(--accent);
+    background: linear-gradient(135deg, rgba(255,198,92,0.14), rgba(108,192,255,0.10));
+    border: 1px solid rgba(255,198,92,0.3);
+    border-radius: 14px;
+    padding: 10px 18px;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: center;
+    gap: 6px 14px;
+    margin: 0 auto 22px;
+    width: fit-content;
+    max-width: 92%;
+  }
+  .daily-top-banner .dtb-title {
+    width: 100%;
+    font-weight: bold;
+    margin-bottom: 2px;
+  }
+  .daily-top-banner .dtb-entry {
+    white-space: nowrap;
   }
 
   .kicker {
@@ -480,7 +511,7 @@
     <p class="site-sub">منافسة ساعات المذاكرة بين دفعات كلية الطب</p>
 
     <p class="leader-banner" id="leaderBanner" style="display:none"></p>
-    <p class="leader-banner" id="dailyTopBanner" style="display:none"></p>
+    <div class="daily-top-banner" id="dailyTopBanner" style="display:none"></div>
 
     <div class="hero">
       <p class="hero-number" id="heroNumber">—</p>
@@ -588,9 +619,10 @@
       return;
     }
     const medals = ['🥇', '🥈', '🥉'];
-    el.style.display = 'block';
-    el.innerHTML = '<span class="crown">👑</span> أبطال اليوم: ' +
-      top.map((r, i) => `${medals[i]} ${r.name}`).join('  ·  ');
+    el.style.display = 'flex';
+    el.innerHTML =
+      '<span class="dtb-title"><span class="crown">👑</span> أبطال اليوم</span>' +
+      top.map((r, i) => `<span class="dtb-entry">${medals[i]} ${r.name}</span>`).join('');
   }
 
   function renderLeaderBanner() {
