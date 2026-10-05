@@ -82,6 +82,8 @@ GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID", "")  # e.g. -1001234567890
 TOPIC_ACHIEVEMENTS_ID = os.environ.get("TOPIC_ACHIEVEMENTS_ID", "")
 TOPIC_SESSIONS_ID = os.environ.get("TOPIC_SESSIONS_ID", "")
 TOPIC_CHAT_ID = os.environ.get("TOPIC_CHAT_ID", "")  # 💬 الدردشة العامة — used by the daily poll
+TOPIC_SUGGESTIONS_ID = os.environ.get("TOPIC_SUGGESTIONS_ID", "")  # 💡 أفكار واقتراحات — has its own cooldown
+SUGGESTION_COOLDOWN_SECONDS = int(os.environ.get("SUGGESTION_COOLDOWN_SECONDS", "120"))
 TOPIC_ANNOUNCEMENTS_ID = os.environ.get("TOPIC_ANNOUNCEMENTS_ID", "")
 
 
@@ -314,6 +316,14 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             count INTEGER DEFAULT 0,
             last_strike_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS suggestion_cooldowns (
+            user_id INTEGER PRIMARY KEY,
+            last_posted_at TEXT
         )
         """
     )
@@ -1208,6 +1218,57 @@ async def handle_session_done(update: Update, context: ContextTypes.DEFAULT_TYPE
     done_set.add(start.isoformat())
     _save_schedule_state(sched)
     await _refresh_pinned_schedule(context)
+
+
+async def handle_suggestion_cooldown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enforces a per-user cooldown in the suggestions topic specifically
+    — Telegram's own Slow Mode only applies group-wide (confirmed: this
+    is an open feature request on Telegram's own tracker, not something
+    that exists yet), so this is the bot doing it manually for just this
+    one topic. A rapid-fire second message within the cooldown window
+    gets deleted (requires the bot to have 'Delete Messages' admin
+    rights) rather than just warned about, so the topic actually stays
+    readable instead of filling with spam."""
+    if not TOPIC_SUGGESTIONS_ID or not update.message:
+        return
+    if str(getattr(update.message, "message_thread_id", "")) != str(TOPIC_SUGGESTIONS_ID):
+        return
+
+    user = update.effective_user
+    conn = db()
+    row = conn.execute(
+        "SELECT last_posted_at FROM suggestion_cooldowns WHERE user_id=?", (user.id,)
+    ).fetchone()
+    now = datetime.utcnow()
+    if row:
+        elapsed = (now - datetime.fromisoformat(row["last_posted_at"])).total_seconds()
+        if elapsed < SUGGESTION_COOLDOWN_SECONDS:
+            try:
+                await update.message.delete()
+                wait = int(SUGGESTION_COOLDOWN_SECONDS - elapsed)
+                warning = await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"⏳ تمهّل شوي — تقدر ترسل اقتراح ثاني بعد {wait} ثانية.",
+                    message_thread_id=update.message.message_thread_id,
+                )
+                # Auto-cleanup: delete the warning itself shortly after,
+                # so the topic doesn't fill up with bot nag messages.
+                context.job_queue.run_once(
+                    lambda ctx: ctx.bot.delete_message(chat_id=warning.chat_id, message_id=warning.message_id),
+                    when=8,
+                )
+            except Exception:
+                logger.info("Could not enforce suggestion cooldown (check bot delete permission)")
+            conn.close()
+            return
+
+    conn.execute(
+        "INSERT INTO suggestion_cooldowns (user_id, last_posted_at) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET last_posted_at=excluded.last_posted_at",
+        (user.id, now.isoformat()),
+    )
+    conn.commit()
+    conn.close()
 
 
 _URL_PATTERN = re.compile(r"https?://\S+")
@@ -2807,6 +2868,10 @@ def main():
     # filter, and a single group only runs the first match by default —
     # a different group makes BOTH actually process every text message.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_session_link), group=1)
+    # group=2: catches ANY message type (text, photos, etc.) in the
+    # suggestions topic specifically — separate group so it runs
+    # independently of the other two text handlers above.
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_suggestion_cooldown), group=2)
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     # Schedule automated posts (times are local per TZ_OFFSET_HOURS, expressed as UTC here)
