@@ -693,6 +693,23 @@ def current_streak(user_id: int, as_of: date | None = None) -> int:
     return streak
 
 
+def display_streak(user_id: int) -> int:
+    """The streak a person should actually SEE right now — doesn't drop
+    to 0 just because they haven't logged YET today, since the day isn't
+    over. A streak only genuinely breaks once a full day passes with zero
+    activity (checked by the separate break-detector job), not the
+    instant a new day begins before someone's had a chance to log. This
+    is what public-facing displays (the website, /stats) should use —
+    current_streak() itself stays strict/today-anchored, since internal
+    logic (milestone announcements right after logging, the break
+    detector) genuinely needs that exact behavior."""
+    today = local_today()
+    streak = current_streak(user_id, as_of=today)
+    if streak > 0:
+        return streak
+    return current_streak(user_id, as_of=today - timedelta(days=1))
+
+
 def get_top_streaks(limit: int = 8):
     """Top current streaks across all registered users. O(n) over the
     user list — fine at this scale, revisit if it ever gets huge."""
@@ -701,7 +718,7 @@ def get_top_streaks(limit: int = 8):
     conn.close()
     results = []
     for u in users:
-        s = current_streak(u["user_id"])
+        s = display_streak(u["user_id"])
         if s > 0:
             results.append({"name": u["display_name"], "batch": u["batch"], "streak": s})
     results.sort(key=lambda r: r["streak"], reverse=True)
@@ -1481,7 +1498,7 @@ async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("سجّل نفسك أولًا: /register Med25")
         return
     total = total_minutes(user.id)
-    streak = current_streak(user.id)
+    streak = display_streak(user.id)
     level = level_for_total(total)
     title = level_title_for(level)
     xp = total + streak * STREAK_XP_PER_DAY
@@ -2008,7 +2025,7 @@ async def cmd_strikes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     total = total_minutes(user.id)
-    streak = current_streak(user.id)
+    streak = display_streak(user.id)
     level = level_for_total(total)
     title = level_title_for(level)
     remaining = minutes_for_next_level(total)
