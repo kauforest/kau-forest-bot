@@ -663,6 +663,219 @@ def most_improved(this_week_start: date, last_week_start: date):
     return best_user, best_delta
 
 
+# ---------------------------------------------------------------------------
+# Personal analytics (website "تحليلاتي" page + weekly recap DM insight)
+# ---------------------------------------------------------------------------
+
+
+def find_user_by_telegram_handle(handle: str) -> int | None:
+    """Resolve a Telegram @username typed into the website's 'تحليلاتي'
+    lookup to exactly one registered user_id. Exact match only — unlike
+    find_users_by_name's LIKE search (used by admin-facing bot commands
+    like /compare), a public unauthenticated lookup box shouldn't have to
+    disambiguate between several partial matches. Checks the registered
+    display_name first (set to @username by default_display_name at
+    registration), then falls back to the most recent Telegram username
+    actually seen on a logged session, since display_name can later be
+    overridden by /setname while the person's real Telegram handle stays
+    the same."""
+    handle_clean = handle.strip().lstrip("@").lower()
+    if not handle_clean:
+        return None
+    conn = db()
+    row = conn.execute(
+        "SELECT user_id FROM users WHERE LOWER(display_name) = ?", (f"@{handle_clean}",)
+    ).fetchone()
+    if not row:
+        row = conn.execute(
+            "SELECT user_id FROM sessions WHERE LOWER(username) = ? ORDER BY logged_at DESC LIMIT 1",
+            (handle_clean,),
+        ).fetchone()
+    conn.close()
+    return row["user_id"] if row else None
+
+
+def daily_minutes_series(user_id: int, days: int = 30) -> list[dict]:
+    """Effective daily minutes for the last `days` days, INCLUDING days with
+    zero activity (needed for a continuous chart on the website) — unlike
+    the leaderboard helpers above, which only ever return rows that exist.
+    Uses _EFFECTIVE_CTE so a day with a daily_card screenshot isn't
+    double-counted against that day's session rows, same as everywhere
+    else this CTE is used."""
+    today = local_today()
+    since = today - timedelta(days=days - 1)
+    conn = db()
+    rows = conn.execute(
+        _EFFECTIVE_CTE
+        + "SELECT session_date, minutes FROM daily_effective WHERE user_id=:uid",
+        {"since": since.isoformat(), "uid": user_id},
+    ).fetchall()
+    conn.close()
+    by_date = {r["session_date"]: r["minutes"] for r in rows}
+    series = []
+    for i in range(days):
+        d = since + timedelta(days=i)
+        series.append({"date": d.isoformat(), "minutes": by_date.get(d.isoformat(), 0)})
+    return series
+
+
+def minutes_between(user_id: int, since_date: date, until_date: date | None = None) -> int:
+    """Effective total minutes for one user in [since_date, until_date) —
+    until_date open-ended means 'through today'. Same _EFFECTIVE_CTE-backed
+    reconciliation as total_minutes()/leaderboard(), just bounded on both
+    ends instead of only a lower bound, so it can express "last week" too."""
+    conn = db()
+    query = _EFFECTIVE_CTE + "SELECT COALESCE(SUM(minutes),0) AS m FROM daily_effective WHERE user_id=:uid"
+    params = {"since": since_date.isoformat(), "uid": user_id}
+    if until_date:
+        query += " AND session_date < :until"
+        params["until"] = until_date.isoformat()
+    row = conn.execute(query, params).fetchone()
+    conn.close()
+    return row["m"]
+
+
+def _weekday_ar(d: date) -> str:
+    return WEEKDAY_NAMES_AR[d.weekday()]
+
+
+def best_worst_days(series: list[dict]) -> tuple[dict | None, dict | None]:
+    """Best/worst out of the days that actually had logged activity — a
+    silent day at 0 minutes isn't meaningfully someone's 'worst day', it's
+    just a day off, so it's excluded rather than always winning 'worst'."""
+    active = [d for d in series if d["minutes"] > 0]
+    if not active:
+        return None, None
+    best = max(active, key=lambda d: d["minutes"])
+    worst = min(active, key=lambda d: d["minutes"])
+    return best, worst
+
+
+DAYPART_LABELS_AR = {
+    "morning": "الصباح",
+    "afternoon": "بعد الظهر",
+    "evening": "المساء",
+    "night": "الليل",
+}
+
+MIN_SESSIONS_FOR_TIME_PATTERN = 5
+
+
+def _daypart_for_local_hour(hour: int) -> str:
+    if 5 <= hour <= 11:
+        return "morning"
+    if 12 <= hour <= 16:
+        return "afternoon"
+    if 17 <= hour <= 20:
+        return "evening"
+    return "night"  # 21-23 and 0-4
+
+
+def personal_time_of_day(user_id: int, days: int = 90) -> dict | None:
+    """Buckets this user's individual Timeline-session logs into 4 local
+    day-parts, to surface when they tend to actually study. Deliberately
+    only looks at source='session' rows, NOT daily_card rows: a daily card
+    is a single end-of-day cumulative-total screenshot, usually sent
+    whenever the person remembers to (often at night regardless of when
+    the studying happened), so including it would skew every user toward
+    'night' independent of their real pattern. Returns None below a
+    minimum sample size — not enough data to say anything meaningful."""
+    since = local_today() - timedelta(days=days)
+    conn = db()
+    rows = conn.execute(
+        "SELECT logged_at FROM sessions WHERE user_id=? AND source='session' AND session_date >= ?",
+        (user_id, since.isoformat()),
+    ).fetchall()
+    conn.close()
+    if len(rows) < MIN_SESSIONS_FOR_TIME_PATTERN:
+        return None
+    buckets = {"morning": 0, "afternoon": 0, "evening": 0, "night": 0}
+    for r in rows:
+        try:
+            utc_dt = datetime.fromisoformat(r["logged_at"])
+        except ValueError:
+            continue
+        local_hour = (utc_dt + timedelta(hours=TZ_OFFSET_HOURS)).hour
+        buckets[_daypart_for_local_hour(local_hour)] += 1
+    total = sum(buckets.values())
+    if total < MIN_SESSIONS_FOR_TIME_PATTERN:
+        return None
+    top_key = max(buckets, key=buckets.get)
+    return {
+        "buckets": {DAYPART_LABELS_AR[k]: v for k, v in buckets.items()},
+        "top": DAYPART_LABELS_AR[top_key],
+        "top_pct": round(buckets[top_key] / total * 100),
+        "sample_size": total,
+    }
+
+
+def build_personal_analytics(user_id: int) -> dict | None:
+    """Everything the website's 'تحليلاتي' page needs for one user, in a
+    single payload answered privately over the WebSocket (see ws_handler) —
+    never broadcast to every connected client and never written into the
+    public data.json snapshot, since unlike the leaderboard this carries
+    one person's day-of-week/time-of-day behavior, not just a totals
+    ranking that's already shown publicly."""
+    registered = get_user(user_id)
+    if not registered:
+        return None
+    today = local_today()
+    series = daily_minutes_series(user_id, days=30)
+    best_day, worst_day = best_worst_days(series)
+    week_start = week_start_for(today)
+    this_week = minutes_between(user_id, week_start)
+    last_week = minutes_between(user_id, week_start - timedelta(days=7), week_start)
+    week_over_week_pct = (
+        round((this_week - last_week) / last_week * 100) if last_week > 0 else None
+    )
+    return {
+        "name": registered["display_name"],
+        "batch": registered["batch"],
+        "daily_series": series,
+        "best_day": (
+            {"date": best_day["date"], "weekday": _weekday_ar(date.fromisoformat(best_day["date"])), "minutes": best_day["minutes"]}
+            if best_day else None
+        ),
+        "worst_day": (
+            {"date": worst_day["date"], "weekday": _weekday_ar(date.fromisoformat(worst_day["date"])), "minutes": worst_day["minutes"]}
+            if worst_day else None
+        ),
+        "this_week_minutes": this_week,
+        "last_week_minutes": last_week,
+        "week_over_week_pct": week_over_week_pct,
+        "time_of_day": personal_time_of_day(user_id),
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
+MIN_PAST_DAYS_FOR_RECAP_INSIGHT = 10
+
+
+def personal_week_insight(user_id: int, this_week_total: int, this_week_start: date) -> str | None:
+    """A one-line, data-derived comparison sentence for the weekly recap DM
+    — this week's daily average against the distribution of the user's own
+    past active days (everything strictly before this_week_start, so the
+    week being measured never compares against itself). Needs a minimum
+    amount of history or the comparison is just noise from 1-2 data
+    points; returns None in that case so the caller can skip the line."""
+    conn = db()
+    rows = conn.execute(
+        _EFFECTIVE_CTE
+        + "SELECT minutes FROM daily_effective WHERE user_id=:uid AND session_date < :until",
+        {"since": "2000-01-01", "uid": user_id, "until": this_week_start.isoformat()},
+    ).fetchall()
+    conn.close()
+    past_days = [r["minutes"] for r in rows if r["minutes"] > 0]
+    if len(past_days) < MIN_PAST_DAYS_FOR_RECAP_INSIGHT:
+        return None
+    this_week_avg = this_week_total / 7
+    better_than = sum(1 for m in past_days if this_week_avg > m)
+    pct = round(better_than / len(past_days) * 100)
+    if pct >= 50:
+        return f"📊 ذاكرت هالأسبوع أكثر من {pct}٪ من أيامك السابقة"
+    return f"📊 معدلك هالأسبوع كان أقل من {100 - pct}٪ من أيامك السابقة — رجعتها الأسبوع الجاي 💪"
+
+
 def current_streak(user_id: int, as_of: date | None = None) -> int:
     """Consecutive logged days ending at as_of (defaults to today).
     Passing a past date computes what the streak was/would have been as
@@ -863,17 +1076,44 @@ async def broadcast_update():
     CONNECTED_CLIENTS.difference_update(dead)
 
 
+async def _handle_ws_request(websocket, raw_message):
+    """The one inbound message type the site actually sends: a 'تحليلاتي'
+    (My Analytics) lookup from docs/index.html. Answered directly to the
+    requesting socket ONLY — never via broadcast_update() / CONNECTED_CLIENTS
+    — since the response can carry another member's personal daily/time-of-day
+    pattern that nobody else asked for and that must never end up folded into
+    the shared leaderboard payload (which is also what the public data.json
+    snapshot is built from)."""
+    try:
+        request = json.loads(raw_message)
+    except (ValueError, TypeError):
+        return
+    if not isinstance(request, dict) or request.get("type") != "personal_analytics":
+        return
+    username = str(request.get("username") or "")[:64]
+    user_id = find_user_by_telegram_handle(username)
+    if user_id is None:
+        response = {"type": "personal_analytics", "found": False}
+    else:
+        response = {"type": "personal_analytics", "found": True, "data": build_personal_analytics(user_id)}
+    try:
+        await websocket.send(json.dumps(response, ensure_ascii=False))
+    except Exception:
+        pass
+
+
 async def ws_handler(websocket):
     """One entry per connected browser tab. Sends the current leaderboard
-    immediately on connect, then just keeps the socket open — all further
+    immediately on connect, then keeps the socket open — leaderboard
     updates come from broadcast_update() being called elsewhere whenever
-    someone logs a session."""
+    someone logs a session; personal-analytics lookups are answered
+    per-request by _handle_ws_request above."""
     CONNECTED_CLIENTS.add(websocket)
     try:
         payload = json.dumps(build_export_data(), ensure_ascii=False)
         await websocket.send(payload)
-        async for _ in websocket:
-            pass  # the site never sends us anything; just keep the connection open
+        async for message in websocket:
+            await _handle_ws_request(websocket, message)
     except Exception:
         pass
     finally:
@@ -2898,6 +3138,8 @@ async def job_weekly_personal_recap(context: ContextTypes.DEFAULT_TYPE):
             gap_line = "👑 كنت الأول بين الكل الأسبوع الماضي!"
         else:
             gap_line = f"🎯 كنت تبعد {top_total - minutes} دقيقة عن المركز الأول"
+        insight = personal_week_insight(u["user_id"], minutes, last_week_start)
+        insight_line = f"\n{insight}" if insight else ""
         try:
             await context.bot.send_message(
                 chat_id=u["user_id"],
@@ -2906,6 +3148,7 @@ async def job_weekly_personal_recap(context: ContextTypes.DEFAULT_TYPE):
                     f"⏱️ ذاكرت {minutes} دقيقة الأسبوع اللي فات\n"
                     f"🔥 الستريك الحالي: {streak} يوم\n"
                     f"{gap_line}"
+                    f"{insight_line}"
                 ),
                 parse_mode="Markdown",
             )

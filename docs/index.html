@@ -501,6 +501,83 @@
     from { opacity: 0; transform: translateY(6px); }
     to { opacity: 1; transform: translateY(0); }
   }
+
+  .ma-toggle-wrap {
+    text-align: center;
+    margin-bottom: 22px;
+  }
+
+  .ma-search {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 18px;
+  }
+
+  .ma-input {
+    flex: 1;
+    min-width: 0;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--text);
+    font-family: 'Tajawal', sans-serif;
+    font-size: 0.95rem;
+    padding: 10px 14px;
+    border-radius: 999px;
+    outline: none;
+  }
+
+  .ma-input::placeholder { color: var(--text-dim); }
+  .ma-input:focus { border-color: var(--accent-3); box-shadow: 0 0 0 2px var(--accent-3-glow); }
+
+  .ma-submit {
+    border: none;
+    background: linear-gradient(135deg, var(--accent-2), var(--accent));
+    color: #0a1e2e;
+    font-family: 'Tajawal', sans-serif;
+    font-weight: 700;
+    font-size: 0.9rem;
+    padding: 0 20px;
+    border-radius: 999px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .ma-name {
+    text-align: center;
+    font-size: 1.05rem;
+    font-weight: 700;
+    margin: 4px 0 16px;
+  }
+
+  .ma-chart {
+    margin: 0 0 4px;
+  }
+
+  .ma-chart svg {
+    width: 100%;
+    height: auto;
+    display: block;
+  }
+
+  .ma-chart-caption {
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 0.78rem;
+    margin: 0 0 18px;
+  }
+
+  .ma-stat {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    padding: 11px 4px;
+    border-bottom: 1px solid var(--line);
+    font-size: 0.92rem;
+  }
+
+  .ma-stat span { color: var(--text-dim); }
+  .ma-stat b { color: var(--accent-2); font-size: 0.95rem; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -531,6 +608,19 @@
 
     <div class="banner" id="examBanner" style="display:none">
       📚 وضع الاختبارات مفعّل — الأولوية للمذاكرة، لا للترتيب
+    </div>
+
+    <div class="ma-toggle-wrap">
+      <button class="pill" id="maToggleBtn">📊 تحليلاتي</button>
+    </div>
+
+    <div class="section" id="myAnalyticsSection" style="display:none">
+      <p class="section-title">📊 تحليلاتي</p>
+      <div class="ma-search">
+        <input type="text" id="maUsernameInput" class="ma-input" dir="ltr" placeholder="@يوزرك_بتيليجرام" maxlength="64">
+        <button class="ma-submit" id="maSubmitBtn">عرض</button>
+      </div>
+      <div id="maResult"></div>
     </div>
 
     <div class="tabs" id="tabs">
@@ -824,6 +914,127 @@
     });
   }
 
+  // ----- تحليلاتي (My Analytics) -----
+  // Looks up one user's own daily pattern by Telegram @username, no login —
+  // same no-auth philosophy as the rest of the site (which already shows
+  // everyone's name + minutes on the public leaderboard above). Answered
+  // over the same live WebSocket connection used for leaderboard updates
+  // (see connectLiveUpdates below): the browser sends a small request and
+  // the bot answers it directly, privately, instead of this riding on the
+  // broadcast leaderboard payload or the static data.json (which is
+  // committed to the public repo — see CLAUDE.md security notes).
+  document.getElementById('maToggleBtn').addEventListener('click', () => {
+    const sec = document.getElementById('myAnalyticsSection');
+    sec.style.display = sec.style.display === 'none' ? 'block' : 'none';
+  });
+
+  function submitMyAnalytics() {
+    const input = document.getElementById('maUsernameInput');
+    const resultEl = document.getElementById('maResult');
+    const username = input.value.trim();
+    if (!username) {
+      resultEl.innerHTML = '<p class="empty">اكتب يوزرك بتيليجرام أول.</p>';
+      return;
+    }
+    if (!window.__liveSocket || window.__liveSocket.readyState !== WebSocket.OPEN) {
+      resultEl.innerHTML = '<p class="empty">الاتصال المباشر غير متوفر حاليًا — جرب تحدّث الصفحة بعد شوي.</p>';
+      return;
+    }
+    resultEl.innerHTML = '<p class="empty">جاري البحث...</p>';
+    window.__liveSocket.send(JSON.stringify({ type: 'personal_analytics', username }));
+  }
+
+  document.getElementById('maSubmitBtn').addEventListener('click', submitMyAnalytics);
+  document.getElementById('maUsernameInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submitMyAnalytics();
+  });
+
+  // Arabic month names, used instead of the raw ISO "YYYY-MM-DD" string:
+  // a dash-separated numeric date inside RTL text visually reorders its
+  // groups (the known Arabic/RTL bidi bug from CLAUDE.md — "2026-09-25"
+  // renders as "25-09-2026") — formatting it as "25 سبتمبر" sidesteps the
+  // bug entirely instead of patching it with directional marks.
+  const AR_MONTHS = ['يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو', 'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر'];
+  function formatArabicDate(isoDate) {
+    const [, m, day] = isoDate.split('-').map(Number);
+    return `${day} ${AR_MONTHS[m - 1]}`;
+  }
+
+  function renderMiniLineChart(series) {
+    const w = 640, h = 150, pad = 8;
+    const maxMin = Math.max(...series.map(p => p.minutes), 1);
+    const stepX = series.length > 1 ? (w - pad * 2) / (series.length - 1) : 0;
+    const points = series.map((p, i) => {
+      const x = pad + i * stepX;
+      const y = h - pad - (p.minutes / maxMin) * (h - pad * 2);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+    const linePoints = points.join(' ');
+    const areaPoints = `${pad},${h - pad} ${linePoints} ${(w - pad).toFixed(1)},${h - pad}`;
+    return `
+      <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+        <defs>
+          <linearGradient id="maGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#3eeeb8" stop-opacity="0.45"/>
+            <stop offset="100%" stop-color="#3eeeb8" stop-opacity="0"/>
+          </linearGradient>
+        </defs>
+        <polygon points="${areaPoints}" fill="url(#maGrad)"/>
+        <polyline points="${linePoints}" fill="none" stroke="#3eeeb8" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+      </svg>
+    `;
+  }
+
+  function renderMyAnalyticsResult(msg) {
+    const resultEl = document.getElementById('maResult');
+    if (!msg.found) {
+      resultEl.innerHTML = '<p class="empty">ما لقيت حساب مسجّل بهذا اليوزر. تأكد من كتابته صح، أو إنك مسجّل بالبوت أصلًا (/register).</p>';
+      return;
+    }
+    const d = msg.data;
+    const series = d.daily_series || [];
+    const hasAnyActivity = series.some(p => p.minutes > 0);
+
+    const chartHtml = hasAnyActivity
+      ? `<div class="ma-chart">${renderMiniLineChart(series)}</div><p class="ma-chart-caption">الدقائق اليومية — آخر 30 يوم</p>`
+      : '<p class="empty">ما فيه جلسات مسجّلة آخر 30 يوم.</p>';
+
+    const bestLine = d.best_day
+      ? `<div class="ma-stat"><span>🏆 أفضل يوم</span><b>${d.best_day.weekday} (${formatArabicDate(d.best_day.date)}) — ${d.best_day.minutes} د</b></div>`
+      : '';
+    const worstLine = d.worst_day
+      ? `<div class="ma-stat"><span>📉 أضعف يوم</span><b>${d.worst_day.weekday} (${formatArabicDate(d.worst_day.date)}) — ${d.worst_day.minutes} د</b></div>`
+      : '';
+
+    let wowLine;
+    if (d.last_week_minutes === 0) {
+      wowLine = d.this_week_minutes > 0
+        ? '<div class="ma-stat"><span>🆕 هذا أول أسبوع نشط لك</span><b>استمر!</b></div>'
+        : '<div class="ma-stat"><span>لا نشاط مسجّل آخر أسبوعين</span></div>';
+    } else {
+      const pct = d.week_over_week_pct;
+      const arrow = pct > 0 ? '📈' : (pct < 0 ? '📉' : '➖');
+      // ‎ (LRM): a signed number like "-67%" is an LTR-ish token sitting
+      // inside RTL text — without this it visually reorders to "67%-" (same
+      // bidi bug as the dates above; see CLAUDE.md gotcha #5).
+      wowLine = `<div class="ma-stat"><span>${arrow} هذا الأسبوع مقارنة باللي فات</span><b>‎${pct > 0 ? '+' : ''}${pct}%</b></div>`;
+    }
+
+    const tod = d.time_of_day;
+    const todLine = tod
+      ? `<div class="ma-stat"><span>⏰ أكثر وقت تذاكر فيه</span><b>${tod.top} (${tod.top_pct}%)</b></div>`
+      : '<p class="empty">ما عندك جلسات كفاية بعد لمعرفة وقتك المفضّل بالمذاكرة.</p>';
+
+    resultEl.innerHTML = `
+      <p class="ma-name">‎${d.name}${d.batch ? `<span class="row-batch">${d.batch}</span>` : ''}</p>
+      ${chartHtml}
+      ${bestLine}
+      ${worstLine}
+      ${wowLine}
+      ${todLine}
+    `;
+  }
+
   document.getElementById('tabs').addEventListener('click', (e) => {
     const btn = e.target.closest('.pill');
     if (!btn) return;
@@ -879,15 +1090,28 @@
     } catch (e) {
       return;
     }
+    window.__liveSocket = ws;
     ws.onopen = () => { window.__liveConnected = true; };
     ws.onmessage = (event) => {
+      let msg;
       try {
-        DATA = JSON.parse(event.data);
-        refreshAllViews();
-      } catch (e) { /* ignore malformed frame */ }
+        msg = JSON.parse(event.data);
+      } catch (e) {
+        return; // ignore malformed frame
+      }
+      // The leaderboard broadcast is a plain data object; a personal-analytics
+      // reply (see submitMyAnalytics above) is tagged so it never gets
+      // mistaken for a full leaderboard refresh (and vice versa).
+      if (msg && msg.type === 'personal_analytics') {
+        renderMyAnalyticsResult(msg);
+        return;
+      }
+      DATA = msg;
+      refreshAllViews();
     };
     ws.onclose = () => {
       window.__liveConnected = false;
+      if (window.__liveSocket === ws) window.__liveSocket = null;
       // Reconnect with capped exponential backoff — survives Railway
       // restarts/deploys without the page needing a manual refresh.
       setTimeout(() => connectLiveUpdates(Math.min(retryDelay * 1.6, 30000)), retryDelay);
