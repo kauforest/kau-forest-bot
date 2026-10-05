@@ -104,7 +104,8 @@ VALID_BATCHES = ["Med22", "Med23", "Med24", "Med25", "Med26", "Med27"]
 # GitHub Pages site can display the leaderboard publicly. Leave any of
 # these unset to disable website syncing entirely (the bot still works).
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. "yourname/study-leaderboard"
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. "yourname/study-leaderboard" — this is PUBLIC, used for the website
+BACKUP_GITHUB_REPO = os.environ.get("BACKUP_GITHUB_REPO", "")  # MUST be a separate PRIVATE repo — real user data goes here
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 GITHUB_DATA_PATH = os.environ.get("GITHUB_DATA_PATH", "data.json")
 # Off by default — the WebSocket live-update system already handles the
@@ -697,7 +698,7 @@ async def check_and_announce_streak_milestones(update, context, user):
                     public_name = registered["display_name"] if registered else user.first_name
                     await context.bot.send_message(
                         chat_id=GROUP_CHAT_ID,
-                        text=f"{STREAK_LABELS[m]}\n{public_name} مستمر بدون انقطاع!",
+                        text=f"{STREAK_LABELS[m]}\n\u200e{public_name} مستمر بدون انقطاع!",
                         **_topic_kwargs(TOPIC_ACHIEVEMENTS_ID),
                     )
     conn.close()
@@ -721,7 +722,7 @@ async def check_and_announce_level_up(update, context, user):
             public_name = registered["display_name"] if registered else user.first_name
             await context.bot.send_message(
                 chat_id=GROUP_CHAT_ID,
-                text=f"⭐ ترقية! {public_name} صار بالمستوى {level} — {title}",
+                text=f"⭐ ترقية! \u200e{public_name} صار بالمستوى {level} — {title}",
                 **_topic_kwargs(TOPIC_ACHIEVEMENTS_ID),
             )
     conn.close()
@@ -809,6 +810,7 @@ def build_export_data() -> dict:
         "monthly": _rows_to_list(leaderboard(month_start, limit=50)),
         "all_time": _rows_to_list(leaderboard(epoch, limit=50)),
         "weekly_by_batch": weekly_by_batch,
+        "all_batches": VALID_BATCHES,  # always the full list — so a quiet batch's filter chip never disappears
         "weekly_batch_averages": batch_averages(week_start),
         "weekly_batch_totals": batch_totals(week_start),
         "hall_of_fame": hall_of_fame,
@@ -870,15 +872,18 @@ async def start_ws_server(app):
     logger.info(f"Live-update WebSocket server listening on 0.0.0.0:{port}")
 
 
-def _push_file_to_github(repo_path: str, content_bytes: bytes, commit_message: str) -> bool:
+def _push_file_to_github(repo_path: str, content_bytes: bytes, commit_message: str, repo: str | None = None) -> bool:
     """Shared GitHub Contents API push (used by both the leaderboard sync
     and the DB backup below). Silently no-ops if the GitHub env vars
-    aren't set, or if `requests` is missing — caller just gets False back."""
-    if not (REQUESTS_AVAILABLE and GITHUB_TOKEN and GITHUB_REPO):
+    aren't set, or if `requests` is missing — caller just gets False back.
+    `repo` overrides which repo to push to (the DB backup uses this to
+    target a private repo instead of the public GITHUB_REPO)."""
+    target_repo = repo or GITHUB_REPO
+    if not (REQUESTS_AVAILABLE and GITHUB_TOKEN and target_repo):
         return False
 
     content_b64 = base64.b64encode(content_bytes).decode("utf-8")
-    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{repo_path}"
+    api_url = f"https://api.github.com/repos/{target_repo}/contents/{repo_path}"
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
@@ -920,17 +925,26 @@ def push_leaderboard_to_github():
 
 def backup_database_to_github():
     """Pushes the real SQLite database file itself (not just the
-    leaderboard JSON) to a private backup path in the repo, once a day.
-    This is the actual data — sessions, streaks, founder status, everyone's
-    history — which otherwise lives ONLY on Railway's disk with no
-    redundancy. A single overwritten 'latest' file, not timestamped
-    snapshots, to avoid the repo quietly filling up with database copies."""
+    leaderboard JSON) once a day — the actual data, including every
+    user's Telegram ID, display name, batch, minutes, and self-declared
+    Forest username, which otherwise lives ONLY on Railway's disk with no
+    redundancy. Deliberately requires its OWN destination
+    (BACKUP_GITHUB_REPO), separate from GITHUB_REPO — that repo is
+    PUBLIC (needed for the website), so backing up real user data there
+    would make it publicly downloadable. Off entirely until a private
+    repo is explicitly configured, rather than silently falling back to
+    the public one."""
+    if not BACKUP_GITHUB_REPO:
+        return
     if not os.path.exists(DB_PATH):
         return
     with open(DB_PATH, "rb") as f:
         db_bytes = f.read()
     ok = _push_file_to_github(
-        "backups/forest-latest.db", db_bytes, f"Automated DB backup {local_today().isoformat()}"
+        "backups/forest-latest.db",
+        db_bytes,
+        f"Automated DB backup {local_today().isoformat()}",
+        repo=BACKUP_GITHUB_REPO,
     )
     if ok:
         logger.info("Database backup pushed to GitHub")
@@ -1827,7 +1841,7 @@ async def check_and_announce_milestones(update, context, user):
                     public_name = registered["display_name"] if registered else user.first_name
                     await context.bot.send_message(
                         chat_id=GROUP_CHAT_ID,
-                        text=f"🎉 مبروك لـ {public_name}!\n{MILESTONE_LABELS[m]}",
+                        text=f"🎉 مبروك لـ \u200e{public_name}!\n{MILESTONE_LABELS[m]}",
                         **_topic_kwargs(TOPIC_ACHIEVEMENTS_ID),
                     )
     conn.close()
@@ -1873,6 +1887,14 @@ def is_daily_card_screenshot(text: str) -> bool:
     if "focused time" in t or "focus statistics" in t or "focus trend" in t:
         return True
     return bool(re.search(r"\d{2}\.\d{2}\s*20\d{2}", text))
+
+
+MAX_DAILY_CARD_MINUTES = int(os.environ.get("MAX_DAILY_CARD_MINUTES", "960"))
+# 960 = 16 hours. 1440 (the literal 24h max) is technically possible but
+# not realistic — nobody genuinely focus-studies for 18-23 real hours in
+# one day, so a reading that high is almost certainly a misread. 16 hours
+# leaves real headroom for an extreme marathon day while still catching
+# clearly-impossible numbers like 1380. Adjust via the env var if needed.
 
 
 def extract_daily_card_minutes(text: str) -> int | None:
@@ -2020,6 +2042,18 @@ async def _ocr_and_prepare(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if LAUNCH_DATE and card_date < date.fromisoformat(LAUNCH_DATE):
             await update.message.reply_text(
                 f"⚠️ هذا التاريخ قبل بداية المسابقة الرسمية ({LAUNCH_DATE}) — ما يُحتسب."
+            )
+            return None
+        if minutes > MAX_DAILY_CARD_MINUTES:
+            # A day genuinely only has 1440 minutes — anything above that
+            # is a misread (OCR grabbed the wrong number from the card),
+            # not a real value. Reject rather than silently accepting an
+            # impossible number that would show up publicly as a
+            # "1,300-minute day," which is exactly what happened here.
+            hours_cap = MAX_DAILY_CARD_MINUTES // 60
+            await update.message.reply_text(
+                f"⚠️ الرقم اللي قريته ({minutes} دقيقة) أكثر من {hours_cap} ساعة — رقم غير واقعي، على الأغلب قراءة غلط. "
+                "صوّر البطاقة بوضوح أكثر وجرّب مرة ثانية. (لو فعلًا ذاكرت هالقدر، تواصل مع أحد الأدمنز)."
             )
             return None
 
