@@ -1601,40 +1601,6 @@ async def cmd_mytree(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-FUN_FACTS = [
-    "القلب البشري يضخ تقريبًا 7500 لتر دم يوميًا — أكثر من حوض سباحة صغير 🫀",
-    "الكبد هو العضو الوحيد اللي يقدر يعيد تجديد نفسه كامل لو انقطع جزء منه 🔄",
-    "الدماغ يستهلك حوالي 20% من طاقة الجسم، رغم إنه بس 2% من وزنه 🧠",
-    "العظم أقوى من الفولاذ بنفس الوزن تقريبًا، لين درجة معينة من الضغط 🦴",
-    "العين البشرية تقدر تميّز حوالي 10 مليون لون مختلف 👁️",
-    "الخلايا العصبية تقدر توصل إشارات بسرعة توصل 120 متر/ثانية ⚡",
-    "الأمعاء الدقيقة طولها لو فردتها يوصل حوالي 6 أمتار 🌀",
-]
-
-
-async def cmd_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/fact — random light medical trivia, fits the audience, purely
-    for a quick fun read, no pressure to act on it."""
-    import random
-
-    await update.message.reply_text(random.choice(FUN_FACTS))
-
-
-EIGHTBALL_ANSWERS = [
-    "أكيد 💯", "على الأغلب", "مو واضح، جرب تسأل بعدين",
-    "لا أعتقد", "الدلائل تقول لا", "اسأل قلبك 😏",
-    "طبعًا!", "بعيد جدًا", "ركّز بمذاكرتك أول، بعدين نتكلم 📚",
-]
-
-
-async def cmd_8ball(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/8ball <question> — classic magic-8-ball novelty, zero study
-    pressure, pure fun/curiosity bait."""
-    import random
-
-    await update.message.reply_text(random.choice(EIGHTBALL_ANSWERS))
-
-
 async def cmd_coffee(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/coffee <name> — sends someone a small public encouragement,
     meant to build warmth between people rather than being about stats
@@ -3059,8 +3025,6 @@ def main():
     app.add_handler(CommandHandler("compare", cmd_compare))
     app.add_handler(CommandHandler("motivate", cmd_motivate))
     app.add_handler(CommandHandler("mytree", cmd_mytree))
-    app.add_handler(CommandHandler("fact", cmd_fact))
-    app.add_handler(CommandHandler("8ball", cmd_8ball))
     app.add_handler(CommandHandler("coffee", cmd_coffee))
     app.add_handler(CommandHandler("log", cmd_log))
     app.add_handler(CommandHandler("strike", cmd_strike))
@@ -3121,3 +3085,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
