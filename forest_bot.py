@@ -231,6 +231,12 @@ def init_db():
         conn.execute("ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'session'")
     except sqlite3.OperationalError:
         pass
+    # Lightweight data fix: normalize any tag stored before _normalize_tag
+    # existed, the same way (lowercase + strip) new ones are normalized at
+    # write time — otherwise an old "BIO101" row would still never match a
+    # new "/findpartner bio101" lookup. Safe to run on every startup:
+    # already-normalized rows (and NULLs) fail the WHERE and are skipped.
+    conn.execute("UPDATE sessions SET tag = LOWER(TRIM(tag)) WHERE tag IS NOT NULL AND tag != LOWER(TRIM(tag))")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS milestones_hit (
@@ -281,6 +287,19 @@ def init_db():
             name TEXT,
             batch TEXT,
             minutes INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS monthly_titles (
+            month_start TEXT PRIMARY KEY,
+            star_user_id INTEGER,
+            star_name TEXT,
+            star_batch TEXT,
+            star_minutes INTEGER,
+            pioneer_batch TEXT,
+            pioneer_minutes INTEGER
         )
         """
     )
@@ -430,6 +449,53 @@ def get_hall_of_fame(limit: int = 12):
     return rows
 
 
+def record_monthly_titles(
+    month_start: date,
+    star_user_id: int,
+    star_name: str,
+    star_batch: str,
+    star_minutes: int,
+    pioneer_batch: str,
+    pioneer_minutes: int,
+):
+    """Persists نجم الشهر (top individual) + رواد الشهر (top batch) for one
+    month — queryable later (website, /me, ...) even though displaying it
+    there isn't part of this change. Same upsert-by-period-key shape as
+    record_hall_of_fame above, so re-running job_monthly_titles for a month
+    it already awarded (e.g. a restart right after it fired) just overwrites
+    with the same recomputed values instead of erroring or duplicating."""
+    conn = db()
+    conn.execute(
+        "INSERT INTO monthly_titles "
+        "(month_start, star_user_id, star_name, star_batch, star_minutes, pioneer_batch, pioneer_minutes) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(month_start) DO UPDATE SET "
+        "star_user_id=excluded.star_user_id, star_name=excluded.star_name, "
+        "star_batch=excluded.star_batch, star_minutes=excluded.star_minutes, "
+        "pioneer_batch=excluded.pioneer_batch, pioneer_minutes=excluded.pioneer_minutes",
+        (
+            month_start.isoformat(),
+            star_user_id,
+            star_name,
+            star_batch,
+            star_minutes,
+            pioneer_batch,
+            pioneer_minutes,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_monthly_titles(limit: int = 12):
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM monthly_titles ORDER BY month_start DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 def get_user(user_id: int):
     conn = db()
     row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
@@ -478,6 +544,18 @@ def week_start_for(d: date) -> date:
     return d - timedelta(days=(d.weekday() + 1) % 7)
 
 
+def _normalize_tag(tag: str | None) -> str | None:
+    """Subject tags are free text and /findpartner's matching key — without
+    this, 'bio101' and 'BIO101' (or trailing/leading whitespace) are
+    treated as different subjects and silently never match. Lowercase +
+    strip, applied both when a tag is stored (here, in log_session) and
+    when one is looked up (cmd_findpartner's query side)."""
+    if tag is None:
+        return None
+    normalized = tag.strip().lower()
+    return normalized or None
+
+
 def log_session(user_id: int, username: str, minutes: int, tag: str | None):
     """A single Forest-session entry (Timeline screenshot). Multiple of
     these on the same day ADD UP — unless a daily_card entry exists for
@@ -490,7 +568,7 @@ def log_session(user_id: int, username: str, minutes: int, tag: str | None):
             user_id,
             username,
             minutes,
-            tag,
+            _normalize_tag(tag),
             datetime.utcnow().isoformat(),
             local_today().isoformat(),
         ),
@@ -576,7 +654,12 @@ def total_minutes(user_id: int) -> int:
     return row["m"]
 
 
-def leaderboard(since_date: date, limit: int = 10, batch: str | None = None):
+def leaderboard(since_date: date, limit: int = 10, batch: str | None = None, until_date: date | None = None):
+    """until_date open-ended (None, the default) means 'through today', same
+    as every other caller already relies on. Pass it for a bounded, COMPLETED
+    period instead — e.g. job_monthly_titles below, which must not let an
+    in-progress month's partial data get credited as a finished month's
+    award."""
     conn = db()
     query = (
         _EFFECTIVE_CTE
@@ -590,9 +673,15 @@ def leaderboard(since_date: date, limit: int = 10, batch: str | None = None):
         """
     )
     params = {"since": since_date.isoformat()}
+    conditions = []
     if batch:
-        query += " WHERE u.batch = :batch"
+        conditions.append("u.batch = :batch")
         params["batch"] = batch
+    if until_date:
+        conditions.append("de.session_date < :until")
+        params["until"] = until_date.isoformat()
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
     query += " GROUP BY de.user_id ORDER BY total DESC LIMIT :limit"
     params["limit"] = limit
     rows = conn.execute(query, params).fetchall()
@@ -984,20 +1073,25 @@ def _rows_to_list(rows):
     return out
 
 
-def batch_totals(since_date: date) -> dict:
+def batch_totals(since_date: date, until_date: date | None = None) -> dict:
     """Raw sum per batch — deliberately kept alongside the per-capita average:
     a batch can climb this one just by recruiting more people, which is the
-    point (it's the growth/recruitment incentive)."""
+    point (it's the growth/recruitment incentive). until_date open-ended
+    (None) means 'through today', same convention as leaderboard() above."""
     conn = db()
-    rows = conn.execute(
+    query = (
         _EFFECTIVE_CTE
         + """
         SELECT u.batch, SUM(de.minutes) AS total
         FROM daily_effective de JOIN users u ON u.user_id = de.user_id
-        GROUP BY u.batch
-        """,
-        {"since": since_date.isoformat()},
-    ).fetchall()
+        """
+    )
+    params = {"since": since_date.isoformat()}
+    if until_date:
+        query += " WHERE de.session_date < :until"
+        params["until"] = until_date.isoformat()
+    query += " GROUP BY u.batch"
+    rows = conn.execute(query, params).fetchall()
     conn.close()
     return {r["batch"]: r["total"] for r in rows}
 
@@ -1882,7 +1976,13 @@ async def cmd_findpartner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("استخدم: /findpartner اسم المادة")
         return
-    tag = " ".join(context.args)
+    raw_tag = " ".join(context.args)
+    # Match on the NORMALIZED tag (same lowercase+strip as log_session
+    # applies at write time — see _normalize_tag) so "bio101" and "BIO101"
+    # are treated as the same subject instead of silently never matching.
+    # raw_tag (the user's original typing) is kept separately for display —
+    # only the query side needs normalizing.
+    tag = _normalize_tag(raw_tag)
     cutoff = (local_today() - timedelta(days=7)).isoformat()
     conn = db()
 
@@ -1913,13 +2013,13 @@ async def cmd_findpartner(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not row:
         await update.message.reply_text(
-            f"ما لقيت أحد يذاكر «{tag}» هالأسبوع. جرب لاحقًا أو غيّر المادة."
+            f"ما لقيت أحد يذاكر «{raw_tag}» هالأسبوع. جرب لاحقًا أو غيّر المادة."
         )
         return
 
     batch_note = "" if same_batch else f" (من {row['batch']}، مو نفس دفعتك)"
     await update.message.reply_text(
-        f"🤝 لقيت لك رفيق مذاكرة لمادة «{tag}»: {row['name']}{batch_note}\n"
+        f"🤝 لقيت لك رفيق مذاكرة لمادة «{raw_tag}»: {row['name']}{batch_note}\n"
         "راسله وابدأوا جلسة Plant Together!"
     )
 
@@ -3236,6 +3336,62 @@ async def job_monthly_recap(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text, **_topic_kwargs(TOPIC_ACHIEVEMENTS_ID))
 
 
+async def job_monthly_titles(context: ContextTypes.DEFAULT_TYPE):
+    """Runs the morning of the 1st, right after job_monthly_recap above —
+    awards the month that JUST ENDED (not the new one starting today):
+    'نجم الشهر' to the individual with the most minutes, and 'رواد الشهر'
+    to the batch with the highest collective total. The monthly
+    counterpart to job_weekly_leaderboard's Hall-of-Fame winner, same
+    _EFFECTIVE_CTE-backed leaderboard()/batch_totals() helpers, same
+    TOPIC_ACHIEVEMENTS_ID routing.
+
+    NOTE: unlike this job, the EXISTING job_monthly_recap right above
+    computes month_start as today.replace(day=1) while today IS the 1st —
+    so its 'month' is the brand-new month that just started, not the one
+    that ended. That looks like a pre-existing bug, but it's untouched
+    here (out of scope for this change) — this job computes its own month
+    boundary correctly rather than reusing that pattern.
+
+    Persisted to monthly_titles via record_monthly_titles (not bot_data),
+    so the award survives a restart — see CLAUDE.md gotcha #3 — and can
+    later be queried for display (website, /me, ...) without needing to
+    recompute it."""
+    if not GROUP_CHAT_ID:
+        return
+    today = local_today()
+    this_month_start = today.replace(day=1)
+    last_month_start = (this_month_start - timedelta(days=1)).replace(day=1)
+
+    star_rows = leaderboard(last_month_start, limit=1, until_date=this_month_start)
+    if not star_rows:
+        return  # nobody logged anything last month — nothing to award
+    star = star_rows[0]
+
+    totals = batch_totals(last_month_start, until_date=this_month_start)
+    if not totals:
+        return
+    pioneer_batch = max(totals, key=totals.get)
+    pioneer_minutes = totals[pioneer_batch]
+
+    record_monthly_titles(
+        last_month_start,
+        star["user_id"],
+        star["name"],
+        star["batch"],
+        star["total"],
+        pioneer_batch,
+        pioneer_minutes,
+    )
+
+    batch_tag = f" [{star['batch']}]" if star["batch"] else ""
+    text = (
+        "🏆 ألقاب الشهر الماضي:\n\n"
+        f"⭐ نجم الشهر: {star['name']}{batch_tag} — {star['total']} دقيقة\n"
+        f"🌲 رواد الشهر: {pioneer_batch} — {pioneer_minutes} دقيقة إجمالية"
+    )
+    await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text, **_topic_kwargs(TOPIC_ACHIEVEMENTS_ID))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -3304,6 +3460,8 @@ def main():
     )
     # Monthly recap on the 1st at 09:00 local
     jq.run_monthly(job_monthly_recap, when=dtime(hour=(9 - TZ_OFFSET_HOURS) % 24), day=1)
+    # Monthly titles (نجم الشهر / رواد الشهر) for the month that just ended, right after the recap above
+    jq.run_monthly(job_monthly_titles, when=dtime(hour=(9 - TZ_OFFSET_HOURS) % 24, minute=15), day=1)
     # Personal weekly recap, DM'd individually, Sunday 10:00 local (weekday 6 = Sunday)
     jq.run_daily(
         job_weekly_personal_recap,
