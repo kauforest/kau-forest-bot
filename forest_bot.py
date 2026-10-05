@@ -68,37 +68,6 @@ try:
 except ImportError:
     OCR_AVAILABLE = False
 
-# Optional stat-card image support (/mycard) — kept independently optional
-# like OCR above, so a missing dependency disables just this one command
-# instead of crashing the whole bot on startup.
-#
-# Arabic shaping note: an earlier version of this manually pre-shaped
-# Arabic text with arabic_reshaper + python-bidi before drawing it (the
-# standard workaround for renderers with no complex-text-layout support).
-# That approach was dropped after testing showed it rendering a visible
-# missing-glyph box for "ال" (the definite article — about as common as
-# Arabic text gets): arabic_reshaper converts letters to legacy
-# presentation-form codepoints, and neither Tajawal nor Lalezar maps the
-# isolated-alef presentation form in their cmap (most modern Arabic fonts
-# don't bother — a font's default glyph for alef already IS its isolated
-# form, so there's nothing for that legacy codepoint to add). The actual
-# fix: Pillow ships with `raqm` (HarfBuzz-based real OpenType shaping),
-# which reshapes the ORIGINAL text via the font's GSUB table directly,
-# instead of legacy codepoints — see _card_font()/_card_direction() below. Gated
-# on PIL.features.check("raqm") so a Pillow build without it (unlikely for
-# the official PyPI wheel this project's requirements.txt pins, but not
-# guaranteed) disables the command instead of drawing tofu in production.
-try:
-    from PIL import ImageDraw, ImageFont, ImageFilter
-    import PIL.features
-
-    CARD_IMAGE_AVAILABLE = PIL.features.check("raqm")
-except ImportError:
-    CARD_IMAGE_AVAILABLE = False
-
-# Bundled Tajawal TTFs (same family as the website).
-FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "fonts")
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -262,12 +231,6 @@ def init_db():
         conn.execute("ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'session'")
     except sqlite3.OperationalError:
         pass
-    # Lightweight data fix: normalize any tag stored before _normalize_tag
-    # existed, the same way (lowercase + strip) new ones are normalized at
-    # write time — otherwise an old "BIO101" row would still never match a
-    # new "/findpartner bio101" lookup. Safe to run on every startup:
-    # already-normalized rows (and NULLs) fail the WHERE and are skipped.
-    conn.execute("UPDATE sessions SET tag = LOWER(TRIM(tag)) WHERE tag IS NOT NULL AND tag != LOWER(TRIM(tag))")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS milestones_hit (
@@ -323,19 +286,6 @@ def init_db():
     )
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS monthly_titles (
-            month_start TEXT PRIMARY KEY,
-            star_user_id INTEGER,
-            star_name TEXT,
-            star_batch TEXT,
-            star_minutes INTEGER,
-            pioneer_batch TEXT,
-            pioneer_minutes INTEGER
-        )
-        """
-    )
-    conn.execute(
-        """
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -379,10 +329,11 @@ def init_db():
     )
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS streak_nudges_sent (
+        CREATE TABLE IF NOT EXISTS session_time_windows (
             user_id INTEGER NOT NULL,
-            nudge_date TEXT NOT NULL,
-            PRIMARY KEY (user_id, nudge_date)
+            time_window TEXT NOT NULL,
+            logged_date TEXT NOT NULL,
+            PRIMARY KEY (user_id, time_window, logged_date)
         )
         """
     )
@@ -440,26 +391,6 @@ def mark_screenshot_used(hash_hex: str, user_id: int):
     conn.close()
 
 
-def was_streak_nudge_sent(user_id: int, day: date) -> bool:
-    conn = db()
-    row = conn.execute(
-        "SELECT 1 FROM streak_nudges_sent WHERE user_id=? AND nudge_date=?",
-        (user_id, day.isoformat()),
-    ).fetchone()
-    conn.close()
-    return row is not None
-
-
-def mark_streak_nudge_sent(user_id: int, day: date):
-    conn = db()
-    conn.execute(
-        "INSERT OR IGNORE INTO streak_nudges_sent (user_id, nudge_date) VALUES (?, ?)",
-        (user_id, day.isoformat()),
-    )
-    conn.commit()
-    conn.close()
-
-
 FOUNDER_SLOTS_PER_BATCH = 15
 
 
@@ -504,53 +435,6 @@ def get_hall_of_fame(limit: int = 12):
     conn = db()
     rows = conn.execute(
         "SELECT * FROM hall_of_fame ORDER BY week_start DESC LIMIT ?", (limit,)
-    ).fetchall()
-    conn.close()
-    return rows
-
-
-def record_monthly_titles(
-    month_start: date,
-    star_user_id: int,
-    star_name: str,
-    star_batch: str,
-    star_minutes: int,
-    pioneer_batch: str,
-    pioneer_minutes: int,
-):
-    """Persists نجم الشهر (top individual) + رواد الشهر (top batch) for one
-    month — queryable later (website, /me, ...) even though displaying it
-    there isn't part of this change. Same upsert-by-period-key shape as
-    record_hall_of_fame above, so re-running job_monthly_titles for a month
-    it already awarded (e.g. a restart right after it fired) just overwrites
-    with the same recomputed values instead of erroring or duplicating."""
-    conn = db()
-    conn.execute(
-        "INSERT INTO monthly_titles "
-        "(month_start, star_user_id, star_name, star_batch, star_minutes, pioneer_batch, pioneer_minutes) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(month_start) DO UPDATE SET "
-        "star_user_id=excluded.star_user_id, star_name=excluded.star_name, "
-        "star_batch=excluded.star_batch, star_minutes=excluded.star_minutes, "
-        "pioneer_batch=excluded.pioneer_batch, pioneer_minutes=excluded.pioneer_minutes",
-        (
-            month_start.isoformat(),
-            star_user_id,
-            star_name,
-            star_batch,
-            star_minutes,
-            pioneer_batch,
-            pioneer_minutes,
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_monthly_titles(limit: int = 12):
-    conn = db()
-    rows = conn.execute(
-        "SELECT * FROM monthly_titles ORDER BY month_start DESC LIMIT ?", (limit,)
     ).fetchall()
     conn.close()
     return rows
@@ -604,18 +488,6 @@ def week_start_for(d: date) -> date:
     return d - timedelta(days=(d.weekday() + 1) % 7)
 
 
-def _normalize_tag(tag: str | None) -> str | None:
-    """Subject tags are free text and /findpartner's matching key — without
-    this, 'bio101' and 'BIO101' (or trailing/leading whitespace) are
-    treated as different subjects and silently never match. Lowercase +
-    strip, applied both when a tag is stored (here, in log_session) and
-    when one is looked up (cmd_findpartner's query side)."""
-    if tag is None:
-        return None
-    normalized = tag.strip().lower()
-    return normalized or None
-
-
 def log_session(user_id: int, username: str, minutes: int, tag: str | None):
     """A single Forest-session entry (Timeline screenshot). Multiple of
     these on the same day ADD UP — unless a daily_card entry exists for
@@ -628,7 +500,7 @@ def log_session(user_id: int, username: str, minutes: int, tag: str | None):
             user_id,
             username,
             minutes,
-            _normalize_tag(tag),
+            tag,
             datetime.utcnow().isoformat(),
             local_today().isoformat(),
         ),
@@ -714,12 +586,7 @@ def total_minutes(user_id: int) -> int:
     return row["m"]
 
 
-def leaderboard(since_date: date, limit: int = 10, batch: str | None = None, until_date: date | None = None):
-    """until_date open-ended (None, the default) means 'through today', same
-    as every other caller already relies on. Pass it for a bounded, COMPLETED
-    period instead — e.g. job_monthly_titles below, which must not let an
-    in-progress month's partial data get credited as a finished month's
-    award."""
+def leaderboard(since_date: date, limit: int = 10, batch: str | None = None):
     conn = db()
     query = (
         _EFFECTIVE_CTE
@@ -733,15 +600,9 @@ def leaderboard(since_date: date, limit: int = 10, batch: str | None = None, unt
         """
     )
     params = {"since": since_date.isoformat()}
-    conditions = []
     if batch:
-        conditions.append("u.batch = :batch")
+        query += " WHERE u.batch = :batch"
         params["batch"] = batch
-    if until_date:
-        conditions.append("de.session_date < :until")
-        params["until"] = until_date.isoformat()
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
     query += " GROUP BY de.user_id ORDER BY total DESC LIMIT :limit"
     params["limit"] = limit
     rows = conn.execute(query, params).fetchall()
@@ -810,239 +671,6 @@ def most_improved(this_week_start: date, last_week_start: date):
         if delta > best_delta:
             best_delta, best_user = delta, names.get(uid, str(uid))
     return best_user, best_delta
-
-
-# ---------------------------------------------------------------------------
-# Personal analytics (website "تحليلاتي" page + weekly recap DM insight)
-# ---------------------------------------------------------------------------
-
-
-def find_user_by_telegram_handle(handle: str) -> int | None:
-    """Resolve a Telegram @username typed into the website's 'تحليلاتي'
-    lookup to exactly one registered user_id. Exact match only — unlike
-    find_users_by_name's LIKE search (used by admin-facing bot commands
-    like /compare), a public unauthenticated lookup box shouldn't have to
-    disambiguate between several partial matches. Checks the registered
-    display_name first (set to @username by default_display_name at
-    registration), then falls back to the most recent Telegram username
-    actually seen on a logged session, since display_name can later be
-    overridden by /setname while the person's real Telegram handle stays
-    the same."""
-    handle_clean = handle.strip().lstrip("@").lower()
-    if not handle_clean:
-        return None
-    conn = db()
-    row = conn.execute(
-        "SELECT user_id FROM users WHERE LOWER(display_name) = ?", (f"@{handle_clean}",)
-    ).fetchone()
-    if not row:
-        row = conn.execute(
-            "SELECT user_id FROM sessions WHERE LOWER(username) = ? ORDER BY logged_at DESC LIMIT 1",
-            (handle_clean,),
-        ).fetchone()
-    conn.close()
-    return row["user_id"] if row else None
-
-
-def daily_minutes_series(user_id: int, days: int = 30, since: date | None = None) -> list[dict]:
-    """Effective daily minutes for a run of days, INCLUDING days with zero
-    activity (needed for a continuous chart/heatmap) — unlike the
-    leaderboard helpers above, which only ever return rows that exist.
-    Uses _EFFECTIVE_CTE so a day with a daily_card screenshot isn't
-    double-counted against that day's session rows, same as everywhere
-    else this CTE is used.
-
-    Normally called with just `days` (the last N days through today). Pass
-    `since` instead when the caller needs a specific, aligned start date —
-    e.g. heatmap_series() below, which needs the range to start on a
-    Sunday so the grid's weeks line up — and the length is however many
-    days that implies."""
-    today = local_today()
-    start = since or (today - timedelta(days=days - 1))
-    span = (today - start).days + 1
-    conn = db()
-    rows = conn.execute(
-        _EFFECTIVE_CTE
-        + "SELECT session_date, minutes FROM daily_effective WHERE user_id=:uid",
-        {"since": start.isoformat(), "uid": user_id},
-    ).fetchall()
-    conn.close()
-    by_date = {r["session_date"]: r["minutes"] for r in rows}
-    series = []
-    for i in range(span):
-        d = start + timedelta(days=i)
-        series.append({"date": d.isoformat(), "minutes": by_date.get(d.isoformat(), 0)})
-    return series
-
-
-HEATMAP_WEEKS = 18  # ~4 months — dense enough to be interesting, not so long it's a wall of squares on mobile
-
-
-def heatmap_series(user_id: int) -> list[dict]:
-    """Daily minutes for the last HEATMAP_WEEKS weeks, Sunday-aligned (same
-    week boundary as week_start_for everywhere else in this file) so the
-    website can lay it out as whole weeks-as-columns, GitHub-contributions
-    style."""
-    start = week_start_for(local_today()) - timedelta(weeks=HEATMAP_WEEKS - 1)
-    return daily_minutes_series(user_id, since=start)
-
-
-def minutes_between(user_id: int, since_date: date, until_date: date | None = None) -> int:
-    """Effective total minutes for one user in [since_date, until_date) —
-    until_date open-ended means 'through today'. Same _EFFECTIVE_CTE-backed
-    reconciliation as total_minutes()/leaderboard(), just bounded on both
-    ends instead of only a lower bound, so it can express "last week" too."""
-    conn = db()
-    query = _EFFECTIVE_CTE + "SELECT COALESCE(SUM(minutes),0) AS m FROM daily_effective WHERE user_id=:uid"
-    params = {"since": since_date.isoformat(), "uid": user_id}
-    if until_date:
-        query += " AND session_date < :until"
-        params["until"] = until_date.isoformat()
-    row = conn.execute(query, params).fetchone()
-    conn.close()
-    return row["m"]
-
-
-def _weekday_ar(d: date) -> str:
-    return WEEKDAY_NAMES_AR[d.weekday()]
-
-
-def best_worst_days(series: list[dict]) -> tuple[dict | None, dict | None]:
-    """Best/worst out of the days that actually had logged activity — a
-    silent day at 0 minutes isn't meaningfully someone's 'worst day', it's
-    just a day off, so it's excluded rather than always winning 'worst'."""
-    active = [d for d in series if d["minutes"] > 0]
-    if not active:
-        return None, None
-    best = max(active, key=lambda d: d["minutes"])
-    worst = min(active, key=lambda d: d["minutes"])
-    return best, worst
-
-
-DAYPART_LABELS_AR = {
-    "morning": "الصباح",
-    "afternoon": "بعد الظهر",
-    "evening": "المساء",
-    "night": "الليل",
-}
-
-MIN_SESSIONS_FOR_TIME_PATTERN = 5
-
-
-def _daypart_for_local_hour(hour: int) -> str:
-    if 5 <= hour <= 11:
-        return "morning"
-    if 12 <= hour <= 16:
-        return "afternoon"
-    if 17 <= hour <= 20:
-        return "evening"
-    return "night"  # 21-23 and 0-4
-
-
-def personal_time_of_day(user_id: int, days: int = 90) -> dict | None:
-    """Buckets this user's individual Timeline-session logs into 4 local
-    day-parts, to surface when they tend to actually study. Deliberately
-    only looks at source='session' rows, NOT daily_card rows: a daily card
-    is a single end-of-day cumulative-total screenshot, usually sent
-    whenever the person remembers to (often at night regardless of when
-    the studying happened), so including it would skew every user toward
-    'night' independent of their real pattern. Returns None below a
-    minimum sample size — not enough data to say anything meaningful."""
-    since = local_today() - timedelta(days=days)
-    conn = db()
-    rows = conn.execute(
-        "SELECT logged_at FROM sessions WHERE user_id=? AND source='session' AND session_date >= ?",
-        (user_id, since.isoformat()),
-    ).fetchall()
-    conn.close()
-    if len(rows) < MIN_SESSIONS_FOR_TIME_PATTERN:
-        return None
-    buckets = {"morning": 0, "afternoon": 0, "evening": 0, "night": 0}
-    for r in rows:
-        try:
-            utc_dt = datetime.fromisoformat(r["logged_at"])
-        except ValueError:
-            continue
-        local_hour = (utc_dt + timedelta(hours=TZ_OFFSET_HOURS)).hour
-        buckets[_daypart_for_local_hour(local_hour)] += 1
-    total = sum(buckets.values())
-    if total < MIN_SESSIONS_FOR_TIME_PATTERN:
-        return None
-    top_key = max(buckets, key=buckets.get)
-    return {
-        "buckets": {DAYPART_LABELS_AR[k]: v for k, v in buckets.items()},
-        "top": DAYPART_LABELS_AR[top_key],
-        "top_pct": round(buckets[top_key] / total * 100),
-        "sample_size": total,
-    }
-
-
-def build_personal_analytics(user_id: int) -> dict | None:
-    """Everything the website's 'تحليلاتي' page needs for one user, in a
-    single payload answered privately over the WebSocket (see ws_handler) —
-    never broadcast to every connected client and never written into the
-    public data.json snapshot, since unlike the leaderboard this carries
-    one person's day-of-week/time-of-day behavior, not just a totals
-    ranking that's already shown publicly."""
-    registered = get_user(user_id)
-    if not registered:
-        return None
-    today = local_today()
-    series = daily_minutes_series(user_id, days=30)
-    best_day, worst_day = best_worst_days(series)
-    week_start = week_start_for(today)
-    this_week = minutes_between(user_id, week_start)
-    last_week = minutes_between(user_id, week_start - timedelta(days=7), week_start)
-    week_over_week_pct = (
-        round((this_week - last_week) / last_week * 100) if last_week > 0 else None
-    )
-    return {
-        "name": registered["display_name"],
-        "batch": registered["batch"],
-        "daily_series": series,
-        "best_day": (
-            {"date": best_day["date"], "weekday": _weekday_ar(date.fromisoformat(best_day["date"])), "minutes": best_day["minutes"]}
-            if best_day else None
-        ),
-        "worst_day": (
-            {"date": worst_day["date"], "weekday": _weekday_ar(date.fromisoformat(worst_day["date"])), "minutes": worst_day["minutes"]}
-            if worst_day else None
-        ),
-        "this_week_minutes": this_week,
-        "last_week_minutes": last_week,
-        "week_over_week_pct": week_over_week_pct,
-        "time_of_day": personal_time_of_day(user_id),
-        "heatmap": heatmap_series(user_id),
-        "generated_at": datetime.utcnow().isoformat(),
-    }
-
-
-MIN_PAST_DAYS_FOR_RECAP_INSIGHT = 10
-
-
-def personal_week_insight(user_id: int, this_week_total: int, this_week_start: date) -> str | None:
-    """A one-line, data-derived comparison sentence for the weekly recap DM
-    — this week's daily average against the distribution of the user's own
-    past active days (everything strictly before this_week_start, so the
-    week being measured never compares against itself). Needs a minimum
-    amount of history or the comparison is just noise from 1-2 data
-    points; returns None in that case so the caller can skip the line."""
-    conn = db()
-    rows = conn.execute(
-        _EFFECTIVE_CTE
-        + "SELECT minutes FROM daily_effective WHERE user_id=:uid AND session_date < :until",
-        {"since": "2000-01-01", "uid": user_id, "until": this_week_start.isoformat()},
-    ).fetchall()
-    conn.close()
-    past_days = [r["minutes"] for r in rows if r["minutes"] > 0]
-    if len(past_days) < MIN_PAST_DAYS_FOR_RECAP_INSIGHT:
-        return None
-    this_week_avg = this_week_total / 7
-    better_than = sum(1 for m in past_days if this_week_avg > m)
-    pct = round(better_than / len(past_days) * 100)
-    if pct >= 50:
-        return f"📊 ذاكرت هالأسبوع أكثر من {pct}٪ من أيامك السابقة"
-    return f"📊 معدلك هالأسبوع كان أقل من {100 - pct}٪ من أيامك السابقة — رجعتها الأسبوع الجاي 💪"
 
 
 def current_streak(user_id: int, as_of: date | None = None) -> int:
@@ -1153,25 +781,20 @@ def _rows_to_list(rows):
     return out
 
 
-def batch_totals(since_date: date, until_date: date | None = None) -> dict:
+def batch_totals(since_date: date) -> dict:
     """Raw sum per batch — deliberately kept alongside the per-capita average:
     a batch can climb this one just by recruiting more people, which is the
-    point (it's the growth/recruitment incentive). until_date open-ended
-    (None) means 'through today', same convention as leaderboard() above."""
+    point (it's the growth/recruitment incentive)."""
     conn = db()
-    query = (
+    rows = conn.execute(
         _EFFECTIVE_CTE
         + """
         SELECT u.batch, SUM(de.minutes) AS total
         FROM daily_effective de JOIN users u ON u.user_id = de.user_id
-        """
-    )
-    params = {"since": since_date.isoformat()}
-    if until_date:
-        query += " WHERE de.session_date < :until"
-        params["until"] = until_date.isoformat()
-    query += " GROUP BY u.batch"
-    rows = conn.execute(query, params).fetchall()
+        GROUP BY u.batch
+        """,
+        {"since": since_date.isoformat()},
+    ).fetchall()
     conn.close()
     return {r["batch"]: r["total"] for r in rows}
 
@@ -1250,44 +873,17 @@ async def broadcast_update():
     CONNECTED_CLIENTS.difference_update(dead)
 
 
-async def _handle_ws_request(websocket, raw_message):
-    """The one inbound message type the site actually sends: a 'تحليلاتي'
-    (My Analytics) lookup from docs/index.html. Answered directly to the
-    requesting socket ONLY — never via broadcast_update() / CONNECTED_CLIENTS
-    — since the response can carry another member's personal daily/time-of-day
-    pattern that nobody else asked for and that must never end up folded into
-    the shared leaderboard payload (which is also what the public data.json
-    snapshot is built from)."""
-    try:
-        request = json.loads(raw_message)
-    except (ValueError, TypeError):
-        return
-    if not isinstance(request, dict) or request.get("type") != "personal_analytics":
-        return
-    username = str(request.get("username") or "")[:64]
-    user_id = find_user_by_telegram_handle(username)
-    if user_id is None:
-        response = {"type": "personal_analytics", "found": False}
-    else:
-        response = {"type": "personal_analytics", "found": True, "data": build_personal_analytics(user_id)}
-    try:
-        await websocket.send(json.dumps(response, ensure_ascii=False))
-    except Exception:
-        pass
-
-
 async def ws_handler(websocket):
     """One entry per connected browser tab. Sends the current leaderboard
-    immediately on connect, then keeps the socket open — leaderboard
+    immediately on connect, then just keeps the socket open — all further
     updates come from broadcast_update() being called elsewhere whenever
-    someone logs a session; personal-analytics lookups are answered
-    per-request by _handle_ws_request above."""
+    someone logs a session."""
     CONNECTED_CLIENTS.add(websocket)
     try:
         payload = json.dumps(build_export_data(), ensure_ascii=False)
         await websocket.send(payload)
-        async for message in websocket:
-            await _handle_ws_request(websocket, message)
+        async for _ in websocket:
+            pass  # the site never sends us anything; just keep the connection open
     except Exception:
         pass
     finally:
@@ -1903,171 +1499,6 @@ async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(card)
 
 
-# ---------------------------------------------------------------------------
-# Shareable stat-card image (/mycard)
-# ---------------------------------------------------------------------------
-
-
-def _card_direction(text: str) -> str:
-    """Which way a line should be laid out. Picked from the text's own
-    content rather than assumed, since registered['display_name'] can be
-    either an '@handle' (LTR, the default) or a free-form name someone
-    picked via /setname (could be Arabic). Every OTHER string drawn on
-    the card is written by us and is unambiguously one or the other."""
-    return "rtl" if any("؀" <= ch <= "ۿ" for ch in text) else "ltr"
-
-
-_CARD_FONT_CACHE: dict = {}
-
-
-def _card_font(weight: str, size: int):
-    key = (weight, size)
-    if key not in _CARD_FONT_CACHE:
-        filename = "Tajawal-Bold.ttf" if weight == "bold" else "Tajawal-Regular.ttf"
-        # layout_engine=RAQM: real OpenType shaping (HarfBuzz) from the
-        # font's GSUB table — see the CARD_IMAGE_AVAILABLE comment above
-        # for why this replaced a manual arabic_reshaper/bidi pre-pass.
-        _CARD_FONT_CACHE[key] = ImageFont.truetype(
-            os.path.join(FONT_DIR, filename), size, layout_engine=ImageFont.Layout.RAQM
-        )
-    return _CARD_FONT_CACHE[key]
-
-
-def _card_text(draw, xy, text: str, font, fill):
-    draw.text(xy, text, font=font, fill=fill, anchor="mm", direction=_card_direction(text))
-
-
-def _card_background(size: int = 1080):
-    """Navy base + a few soft blurred color blobs, approximating the
-    website's CSS radial-gradient glow (--accent/--accent-2/--accent-3)
-    since PIL has no CSS gradients — same color stops, different tool."""
-    bg = Image.new("RGB", (size, size), (20, 53, 80))  # --bg
-    glow = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    gdraw = ImageDraw.Draw(glow)
-    radius = int(size * 0.42)
-    blobs = [
-        (int(size * 0.15), int(size * 0.08), (255, 198, 92, 110)),  # --accent (amber)
-        (int(size * 0.90), int(size * 0.12), (108, 192, 255, 110)),  # --accent-3 (blue)
-        (int(size * 0.50), int(size * 0.98), (62, 238, 184, 90)),  # --accent-2 (teal)
-    ]
-    for cx, cy, color in blobs:
-        gdraw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=color)
-    glow = glow.filter(ImageFilter.GaussianBlur(radius=size // 6))
-    return Image.alpha_composite(bg.convert("RGBA"), glow).convert("RGB")
-
-
-def _draw_tree(draw, cx: int, baseline: int, scale: float = 1.0):
-    """A small stand-in for the 🌲 emoji used everywhere else in the bot's
-    text messages — Tajawal (and every other font tried) has no emoji
-    glyphs, so drawing the real emoji as PIL text renders a blank tofu
-    box. Same three-canopy-blob motif as the website's forest SVG."""
-    trunk_w, trunk_h = int(10 * scale), int(34 * scale)
-    draw.rectangle(
-        (cx - trunk_w // 2, baseline - trunk_h, cx + trunk_w // 2, baseline),
-        fill=(92, 70, 50),
-    )
-    r = int(46 * scale)
-    canopy_cy = baseline - trunk_h - int(r * 0.6)
-    for (ox, oy), color in zip(
-        [(0, 0), (-int(r * 0.55), int(r * 0.25)), (int(r * 0.55), int(r * 0.25))],
-        [(227, 168, 59), (163, 201, 168), (127, 182, 140)],
-    ):
-        draw.ellipse(
-            (cx + ox - r, canopy_cy + oy - r, cx + ox + r, canopy_cy + oy + r),
-            fill=color,
-        )
-
-
-def _draw_mini_bars(draw, series: list[dict], x0: float, y0: float, width: float, height: float):
-    """A small last-N-days bar chart, pure vector (no text/font risk)."""
-    n = len(series)
-    if n == 0:
-        return
-    gap = 6
-    bar_w = (width - gap * (n - 1)) / n
-    max_m = max((p["minutes"] for p in series), default=0) or 1
-    for i, p in enumerate(series):
-        bh = max(4, height * (p["minutes"] / max_m)) if p["minutes"] else 4
-        x = x0 + i * (bar_w + gap)
-        color = (62, 238, 184) if p["minutes"] else (50, 82, 108)
-        draw.rounded_rectangle(
-            (x, y0 + height - bh, x + bar_w, y0 + height),
-            radius=min(4, bar_w / 2),
-            fill=color,
-        )
-
-
-def generate_stat_card_image(user_id: int):
-    """Renders /mycard's shareable PNG — the same stats /me already sends
-    as text, but as an actual image sized for a Telegram/WhatsApp status
-    or story, which a text message can't be. Reuses every existing stat
-    helper (total_minutes, current_streak, level_for_total/level_title_for,
-    daily_minutes_series) instead of recomputing anything. Returns None if
-    the user isn't registered."""
-    registered = get_user(user_id)
-    if not registered:
-        return None
-
-    size = 1080
-    cx = size // 2
-    img = _card_background(size)
-    draw = ImageDraw.Draw(img)
-
-    _draw_tree(draw, cx, 190)
-    _card_text(draw, (cx, 255), "غابة الطب", _card_font("bold", 56), (255, 198, 92))
-    _card_text(draw, (cx, 310), "بطاقة إنجاز", _card_font("regular", 28), (195, 221, 240))
-
-    _card_text(draw, (cx, 410), registered["display_name"], _card_font("bold", 46), (255, 250, 240))
-    if registered["batch"]:
-        _card_text(draw, (cx, 460), registered["batch"], _card_font("regular", 28), (195, 221, 240))
-    if registered["founder"]:
-        _card_text(draw, (cx, 500), "رائد الغابة", _card_font("regular", 26), (62, 238, 184))
-
-    total = total_minutes(user_id)
-    streak = current_streak(user_id)
-    level = level_for_total(total)
-    # level_title_for() returns an emoji-prefixed string ("💎 ماسي") meant
-    # for Telegram text messages — Tajawal has no emoji glyphs (same issue
-    # as the 🌲 tree above), so only the Arabic name part is drawn here.
-    title = level_title_for(level).split(" ", 1)[-1]
-
-    _card_text(draw, (cx, 610), str(total // 60), _card_font("bold", 140), (255, 198, 92))
-    _card_text(draw, (cx, 700), "ساعة تركيز إجمالية", _card_font("regular", 32), (195, 221, 240))
-
-    _card_text(draw, (cx, 770), f"Lv{level} · {title}", _card_font("bold", 36), (108, 192, 255))
-    _card_text(draw, (cx, 815), f"ستريك {streak} يوم", _card_font("regular", 32), (255, 250, 240))
-
-    series = daily_minutes_series(user_id, days=14)
-    _draw_mini_bars(draw, series, x0=size * 0.12, y0=890, width=size * 0.76, height=100)
-    _card_text(draw, (cx, 1010), "آخر 14 يوم", _card_font("regular", 24), (195, 221, 240))
-
-    _card_text(draw, (cx, 1055), "#غابة_الطب", _card_font("regular", 24), (255, 198, 92))
-
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
-
-
-async def cmd_mycard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/mycard — a shareable PNG version of /me, sized for posting to a
-    status/story. A SEPARATE command rather than changing /me's existing
-    (already-tested, already-shipped) text output — nothing about /me
-    changes."""
-    user = update.effective_user
-    if not CARD_IMAGE_AVAILABLE:
-        await update.message.reply_text("ميزة البطاقة غير متوفرة حاليًا على السيرفر.")
-        return
-    if not get_user(user.id):
-        await update.message.reply_text("سجّل نفسك أولًا: /register Med25")
-        return
-    buf = generate_stat_card_image(user.id)
-    await update.message.reply_photo(
-        photo=buf,
-        caption="🌲 بطاقتك جاهزة للمشاركة! شاركها بالستوري وتحدى أصحابك 💪\n#غابة_الطب",
-    )
-
-
 COMPARE_VERDICTS_AHEAD = [
     "شد حيلك، لسا فيه وقت تلحقه 💪",
     "لا تستسلم، الفجوة تقدر تردمها 🌱",
@@ -2221,13 +1652,7 @@ async def cmd_findpartner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("استخدم: /findpartner اسم المادة")
         return
-    raw_tag = " ".join(context.args)
-    # Match on the NORMALIZED tag (same lowercase+strip as log_session
-    # applies at write time — see _normalize_tag) so "bio101" and "BIO101"
-    # are treated as the same subject instead of silently never matching.
-    # raw_tag (the user's original typing) is kept separately for display —
-    # only the query side needs normalizing.
-    tag = _normalize_tag(raw_tag)
+    tag = " ".join(context.args)
     cutoff = (local_today() - timedelta(days=7)).isoformat()
     conn = db()
 
@@ -2258,13 +1683,13 @@ async def cmd_findpartner(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not row:
         await update.message.reply_text(
-            f"ما لقيت أحد يذاكر «{raw_tag}» هالأسبوع. جرب لاحقًا أو غيّر المادة."
+            f"ما لقيت أحد يذاكر «{tag}» هالأسبوع. جرب لاحقًا أو غيّر المادة."
         )
         return
 
     batch_note = "" if same_batch else f" (من {row['batch']}، مو نفس دفعتك)"
     await update.message.reply_text(
-        f"🤝 لقيت لك رفيق مذاكرة لمادة «{raw_tag}»: {row['name']}{batch_note}\n"
+        f"🤝 لقيت لك رفيق مذاكرة لمادة «{tag}»: {row['name']}{batch_note}\n"
         "راسله وابدأوا جلسة Plant Together!"
     )
 
@@ -2680,6 +2105,43 @@ MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
+def extract_time_window(text: str) -> str | None:
+    """Pulls the 'HH:MM - HH:MM' clock range a completed Timeline entry
+    always shows (e.g. '14:08 - 15:08'). This is what the content-based
+    duplicate check keys on — unlike the full image hash, re-screenshotting
+    the exact same real session always reproduces this same string,
+    because it's part of the actual session content, not the screenshot's
+    incidental chrome (status bar clock/battery, which changes every time
+    a new screenshot is taken and is what let the raw-hash check get
+    bypassed by repeatedly re-screenshotting one real session)."""
+    import re
+
+    match = re.search(r"(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})", text)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+    return None
+
+
+def is_time_window_used(user_id: int, time_window: str, logged_date: date) -> bool:
+    conn = db()
+    row = conn.execute(
+        "SELECT 1 FROM session_time_windows WHERE user_id=? AND time_window=? AND logged_date=?",
+        (user_id, time_window, logged_date.isoformat()),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_time_window_used(user_id: int, time_window: str, logged_date: date):
+    conn = db()
+    conn.execute(
+        "INSERT OR IGNORE INTO session_time_windows (user_id, time_window, logged_date) VALUES (?, ?, ?)",
+        (user_id, time_window, logged_date.isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
 def extract_minutes_from_ocr(text: str) -> int | None:
     """Parses a single Timeline entry's duration. Priority matters here:
     Forest's own phrasing ('75-minute Apple Tree') is unambiguous, so it's
@@ -2898,7 +2360,15 @@ async def _ocr_and_prepare(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return None
 
-    return minutes, image_hash, "session", None
+    time_window = extract_time_window(text)
+    if time_window and is_time_window_used(user.id, time_window, today):
+        await update.message.reply_text(
+            f"⚠️ هذي الجلسة ({time_window}) مسجّلة عندك من قبل اليوم — ما تُحتسب مرتين، "
+            "حتى لو صورتها من جديد."
+        )
+        return None
+
+    return minutes, image_hash, "session", time_window
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2929,7 +2399,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["pending_minutes"] = minutes
         context.user_data["pending_hash"] = image_hash
         context.user_data["pending_source"] = source
-        context.user_data["pending_date"] = session_date.isoformat() if session_date else None
+        # The 4th field means different things per source: a `date` for
+        # daily_card, a time-window string (e.g. "14:08-15:08") for
+        # session — kept in separate context keys rather than one
+        # overloaded field, since calling .isoformat() on the wrong type
+        # would crash.
+        if source == "daily_card":
+            context.user_data["pending_date"] = session_date.isoformat() if session_date else None
+            context.user_data["pending_time_window"] = None
+        else:
+            context.user_data["pending_date"] = None
+            context.user_data["pending_time_window"] = session_date
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton(b, callback_data=f"regbatch:{b}")] for b in VALID_BATCHES]
         )
@@ -2943,7 +2423,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["pending_minutes"] = minutes
     context.user_data["pending_hash"] = image_hash
     context.user_data["pending_source"] = source
-    context.user_data["pending_date"] = session_date.isoformat() if session_date else None
+    if source == "daily_card":
+        context.user_data["pending_date"] = session_date.isoformat() if session_date else None
+        context.user_data["pending_time_window"] = None
+    else:
+        context.user_data["pending_date"] = None
+        context.user_data["pending_time_window"] = session_date
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -2965,12 +2450,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _finalize_log(
-    update, context, user, minutes: int, image_hash: str | None, source: str, session_date: date | None
+    update, context, user, minutes: int, image_hash: str | None, source: str,
+    session_date: date | None, time_window: str | None = None,
 ):
     if source == "daily_card":
         log_daily_card(user.id, user.username or user.full_name, minutes, session_date)
     else:
         log_session(user.id, user.username or user.full_name, minutes, None)
+        if time_window:
+            mark_time_window_used(user.id, time_window, local_today())
     if image_hash:
         mark_screenshot_used(image_hash, user.id)
     await check_and_announce_milestones(update, context, user)
@@ -3031,14 +2519,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_hash = context.user_data.get("pending_hash")
         date_str = context.user_data.get("pending_date")
         session_date = date.fromisoformat(date_str) if date_str else None
+        time_window = context.user_data.get("pending_time_window")
         if image_hash and is_screenshot_used(image_hash):
             await query.edit_message_text("⚠️ هذي الصورة اتسجّلت بالفعل.")
             return
-        await _finalize_log(update, context, user, minutes, image_hash, source, session_date)
+        # Re-check here too, not just at upload time — someone could
+        # submit two different screenshots of the same real session
+        # before either one is confirmed, and the upload-time check alone
+        # wouldn't catch that race.
+        if source == "session" and time_window and is_time_window_used(user.id, time_window, local_today()):
+            await query.edit_message_text(
+                f"⚠️ هذي الجلسة ({time_window}) مسجّلة عندك من قبل اليوم — ما تُحتسب مرتين."
+            )
+            return
+        await _finalize_log(update, context, user, minutes, image_hash, source, session_date, time_window)
         context.user_data.pop("pending_minutes", None)
         context.user_data.pop("pending_hash", None)
         context.user_data.pop("pending_source", None)
         context.user_data.pop("pending_date", None)
+        context.user_data.pop("pending_time_window", None)
 
     elif query.data == "edit":
         await query.edit_message_text(
@@ -3048,6 +2547,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("pending_hash", None)
         context.user_data.pop("pending_source", None)
         context.user_data.pop("pending_date", None)
+        context.user_data.pop("pending_time_window", None)
 
 
 # ---------------------------------------------------------------------------
@@ -3270,42 +2770,6 @@ def render_schedule_message(sched: dict) -> str:
 STREAK_BREAK_THRESHOLD = 7  # only nudge for a streak that was actually meaningful
 
 
-async def job_streak_save_nudge(context: ContextTypes.DEFAULT_TYPE):
-    """Runs once in the evening, BEFORE the day rolls over — the proactive
-    counterpart to job_check_streak_breaks below (which only reports a
-    break AFTER it already happened, the next morning). Anyone with a
-    real (7+ day) streak who hasn't logged anything yet today gets ONE
-    gentle private reminder while there's still time to save it. Deduped
-    via streak_nudges_sent so a job-queue restart can't double-send the
-    same day's nudge."""
-    today = local_today()
-    yesterday = today - timedelta(days=1)
-
-    conn = db()
-    users = conn.execute("SELECT user_id FROM users").fetchall()
-    conn.close()
-
-    for u in users:
-        streak_at_risk = current_streak(u["user_id"], as_of=yesterday)
-        if streak_at_risk < STREAK_BREAK_THRESHOLD:
-            continue
-        if current_streak(u["user_id"]) > 0:
-            continue  # already logged today — streak isn't actually at risk
-        if was_streak_nudge_sent(u["user_id"], today):
-            continue
-        mark_streak_nudge_sent(u["user_id"], today)
-        try:
-            await context.bot.send_message(
-                chat_id=u["user_id"],
-                text=(
-                    f"🔥 عندك ستريك {streak_at_risk} يوم — لا تخليه ينكسر!\n"
-                    "سجّل جلستك اليوم قبل ما يفوت الوقت 🌱"
-                ),
-            )
-        except Exception:
-            logger.info(f"Could not DM streak-save nudge to user {u['user_id']}")
-
-
 async def job_check_streak_breaks(context: ContextTypes.DEFAULT_TYPE):
     """Once a day, just after midnight: finds anyone whose real streak
     (7+ days) broke yesterday, and sends ONE gentle, private nudge —
@@ -3519,8 +2983,6 @@ async def job_weekly_personal_recap(context: ContextTypes.DEFAULT_TYPE):
             gap_line = "👑 كنت الأول بين الكل الأسبوع الماضي!"
         else:
             gap_line = f"🎯 كنت تبعد {top_total - minutes} دقيقة عن المركز الأول"
-        insight = personal_week_insight(u["user_id"], minutes, last_week_start)
-        insight_line = f"\n{insight}" if insight else ""
         try:
             await context.bot.send_message(
                 chat_id=u["user_id"],
@@ -3529,7 +2991,6 @@ async def job_weekly_personal_recap(context: ContextTypes.DEFAULT_TYPE):
                     f"⏱️ ذاكرت {minutes} دقيقة الأسبوع اللي فات\n"
                     f"🔥 الستريك الحالي: {streak} يوم\n"
                     f"{gap_line}"
-                    f"{insight_line}"
                 ),
                 parse_mode="Markdown",
             )
@@ -3617,62 +3078,6 @@ async def job_monthly_recap(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text, **_topic_kwargs(TOPIC_ACHIEVEMENTS_ID))
 
 
-async def job_monthly_titles(context: ContextTypes.DEFAULT_TYPE):
-    """Runs the morning of the 1st, right after job_monthly_recap above —
-    awards the month that JUST ENDED (not the new one starting today):
-    'نجم الشهر' to the individual with the most minutes, and 'رواد الشهر'
-    to the batch with the highest collective total. The monthly
-    counterpart to job_weekly_leaderboard's Hall-of-Fame winner, same
-    _EFFECTIVE_CTE-backed leaderboard()/batch_totals() helpers, same
-    TOPIC_ACHIEVEMENTS_ID routing.
-
-    NOTE: unlike this job, the EXISTING job_monthly_recap right above
-    computes month_start as today.replace(day=1) while today IS the 1st —
-    so its 'month' is the brand-new month that just started, not the one
-    that ended. That looks like a pre-existing bug, but it's untouched
-    here (out of scope for this change) — this job computes its own month
-    boundary correctly rather than reusing that pattern.
-
-    Persisted to monthly_titles via record_monthly_titles (not bot_data),
-    so the award survives a restart — see CLAUDE.md gotcha #3 — and can
-    later be queried for display (website, /me, ...) without needing to
-    recompute it."""
-    if not GROUP_CHAT_ID:
-        return
-    today = local_today()
-    this_month_start = today.replace(day=1)
-    last_month_start = (this_month_start - timedelta(days=1)).replace(day=1)
-
-    star_rows = leaderboard(last_month_start, limit=1, until_date=this_month_start)
-    if not star_rows:
-        return  # nobody logged anything last month — nothing to award
-    star = star_rows[0]
-
-    totals = batch_totals(last_month_start, until_date=this_month_start)
-    if not totals:
-        return
-    pioneer_batch = max(totals, key=totals.get)
-    pioneer_minutes = totals[pioneer_batch]
-
-    record_monthly_titles(
-        last_month_start,
-        star["user_id"],
-        star["name"],
-        star["batch"],
-        star["total"],
-        pioneer_batch,
-        pioneer_minutes,
-    )
-
-    batch_tag = f" [{star['batch']}]" if star["batch"] else ""
-    text = (
-        "🏆 ألقاب الشهر الماضي:\n\n"
-        f"⭐ نجم الشهر: {star['name']}{batch_tag} — {star['total']} دقيقة\n"
-        f"🌲 رواد الشهر: {pioneer_batch} — {pioneer_minutes} دقيقة إجمالية"
-    )
-    await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text, **_topic_kwargs(TOPIC_ACHIEVEMENTS_ID))
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -3702,7 +3107,6 @@ def main():
     app.add_handler(CommandHandler("exammode", cmd_exammode))
     app.add_handler(CommandHandler("findpartner", cmd_findpartner))
     app.add_handler(CommandHandler("me", cmd_me))
-    app.add_handler(CommandHandler("mycard", cmd_mycard))
     app.add_handler(CommandHandler("compare", cmd_compare))
     app.add_handler(CommandHandler("motivate", cmd_motivate))
     app.add_handler(CommandHandler("mytree", cmd_mytree))
@@ -3742,8 +3146,6 @@ def main():
     )
     # Monthly recap on the 1st at 09:00 local
     jq.run_monthly(job_monthly_recap, when=dtime(hour=(9 - TZ_OFFSET_HOURS) % 24), day=1)
-    # Monthly titles (نجم الشهر / رواد الشهر) for the month that just ended, right after the recap above
-    jq.run_monthly(job_monthly_titles, when=dtime(hour=(9 - TZ_OFFSET_HOURS) % 24, minute=15), day=1)
     # Personal weekly recap, DM'd individually, Sunday 10:00 local (weekday 6 = Sunday)
     jq.run_daily(
         job_weekly_personal_recap,
@@ -3756,9 +3158,6 @@ def main():
     jq.run_daily(job_backup_database, time=dtime(hour=(4 - TZ_OFFSET_HOURS) % 24))
     # Post the day's prayer-aware study-block schedule once, early each morning
     jq.run_daily(job_post_daily_schedule, time=dtime(hour=(0 - TZ_OFFSET_HOURS) % 24, minute=5))
-    # Proactive nudge at 21:00 local, while there's still time tonight to
-    # save a 7+ day streak that hasn't been logged yet today
-    jq.run_daily(job_streak_save_nudge, time=dtime(hour=(21 - TZ_OFFSET_HOURS) % 24))
     # Gentle private nudge for anyone whose 7+ day streak just broke
     jq.run_daily(job_check_streak_breaks, time=dtime(hour=(0 - TZ_OFFSET_HOURS) % 24, minute=15))
     # Check every 5 minutes whether a scheduled block just started
@@ -3771,4 +3170,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
