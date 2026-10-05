@@ -68,6 +68,37 @@ try:
 except ImportError:
     OCR_AVAILABLE = False
 
+# Optional stat-card image support (/mycard) — kept independently optional
+# like OCR above, so a missing dependency disables just this one command
+# instead of crashing the whole bot on startup.
+#
+# Arabic shaping note: an earlier version of this manually pre-shaped
+# Arabic text with arabic_reshaper + python-bidi before drawing it (the
+# standard workaround for renderers with no complex-text-layout support).
+# That approach was dropped after testing showed it rendering a visible
+# missing-glyph box for "ال" (the definite article — about as common as
+# Arabic text gets): arabic_reshaper converts letters to legacy
+# presentation-form codepoints, and neither Tajawal nor Lalezar maps the
+# isolated-alef presentation form in their cmap (most modern Arabic fonts
+# don't bother — a font's default glyph for alef already IS its isolated
+# form, so there's nothing for that legacy codepoint to add). The actual
+# fix: Pillow ships with `raqm` (HarfBuzz-based real OpenType shaping),
+# which reshapes the ORIGINAL text via the font's GSUB table directly,
+# instead of legacy codepoints — see _card_font()/_card_direction() below. Gated
+# on PIL.features.check("raqm") so a Pillow build without it (unlikely for
+# the official PyPI wheel this project's requirements.txt pins, but not
+# guaranteed) disables the command instead of drawing tofu in production.
+try:
+    from PIL import ImageDraw, ImageFont, ImageFilter
+    import PIL.features
+
+    CARD_IMAGE_AVAILABLE = PIL.features.check("raqm")
+except ImportError:
+    CARD_IMAGE_AVAILABLE = False
+
+# Bundled Tajawal TTFs (same family as the website).
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "fonts")
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -327,6 +358,15 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS streak_nudges_sent (
+            user_id INTEGER NOT NULL,
+            nudge_date TEXT NOT NULL,
+            PRIMARY KEY (user_id, nudge_date)
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -376,6 +416,26 @@ def mark_screenshot_used(hash_hex: str, user_id: int):
     conn.execute(
         "INSERT OR IGNORE INTO screenshots (hash, user_id, used_at) VALUES (?, ?, ?)",
         (hash_hex, user_id, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def was_streak_nudge_sent(user_id: int, day: date) -> bool:
+    conn = db()
+    row = conn.execute(
+        "SELECT 1 FROM streak_nudges_sent WHERE user_id=? AND nudge_date=?",
+        (user_id, day.isoformat()),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_streak_nudge_sent(user_id: int, day: date):
+    conn = db()
+    conn.execute(
+        "INSERT OR IGNORE INTO streak_nudges_sent (user_id, nudge_date) VALUES (?, ?)",
+        (user_id, day.isoformat()),
     )
     conn.commit()
     conn.close()
@@ -695,28 +755,47 @@ def find_user_by_telegram_handle(handle: str) -> int | None:
     return row["user_id"] if row else None
 
 
-def daily_minutes_series(user_id: int, days: int = 30) -> list[dict]:
-    """Effective daily minutes for the last `days` days, INCLUDING days with
-    zero activity (needed for a continuous chart on the website) — unlike
-    the leaderboard helpers above, which only ever return rows that exist.
+def daily_minutes_series(user_id: int, days: int = 30, since: date | None = None) -> list[dict]:
+    """Effective daily minutes for a run of days, INCLUDING days with zero
+    activity (needed for a continuous chart/heatmap) — unlike the
+    leaderboard helpers above, which only ever return rows that exist.
     Uses _EFFECTIVE_CTE so a day with a daily_card screenshot isn't
     double-counted against that day's session rows, same as everywhere
-    else this CTE is used."""
+    else this CTE is used.
+
+    Normally called with just `days` (the last N days through today). Pass
+    `since` instead when the caller needs a specific, aligned start date —
+    e.g. heatmap_series() below, which needs the range to start on a
+    Sunday so the grid's weeks line up — and the length is however many
+    days that implies."""
     today = local_today()
-    since = today - timedelta(days=days - 1)
+    start = since or (today - timedelta(days=days - 1))
+    span = (today - start).days + 1
     conn = db()
     rows = conn.execute(
         _EFFECTIVE_CTE
         + "SELECT session_date, minutes FROM daily_effective WHERE user_id=:uid",
-        {"since": since.isoformat(), "uid": user_id},
+        {"since": start.isoformat(), "uid": user_id},
     ).fetchall()
     conn.close()
     by_date = {r["session_date"]: r["minutes"] for r in rows}
     series = []
-    for i in range(days):
-        d = since + timedelta(days=i)
+    for i in range(span):
+        d = start + timedelta(days=i)
         series.append({"date": d.isoformat(), "minutes": by_date.get(d.isoformat(), 0)})
     return series
+
+
+HEATMAP_WEEKS = 18  # ~4 months — dense enough to be interesting, not so long it's a wall of squares on mobile
+
+
+def heatmap_series(user_id: int) -> list[dict]:
+    """Daily minutes for the last HEATMAP_WEEKS weeks, Sunday-aligned (same
+    week boundary as week_start_for everywhere else in this file) so the
+    website can lay it out as whole weeks-as-columns, GitHub-contributions
+    style."""
+    start = week_start_for(local_today()) - timedelta(weeks=HEATMAP_WEEKS - 1)
+    return daily_minutes_series(user_id, since=start)
 
 
 def minutes_between(user_id: int, since_date: date, until_date: date | None = None) -> int:
@@ -844,6 +923,7 @@ def build_personal_analytics(user_id: int) -> dict | None:
         "last_week_minutes": last_week,
         "week_over_week_pct": week_over_week_pct,
         "time_of_day": personal_time_of_day(user_id),
+        "heatmap": heatmap_series(user_id),
         "generated_at": datetime.utcnow().isoformat(),
     }
 
@@ -1727,6 +1807,171 @@ async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "#غابة_الطب"
     )
     await update.message.reply_text(card)
+
+
+# ---------------------------------------------------------------------------
+# Shareable stat-card image (/mycard)
+# ---------------------------------------------------------------------------
+
+
+def _card_direction(text: str) -> str:
+    """Which way a line should be laid out. Picked from the text's own
+    content rather than assumed, since registered['display_name'] can be
+    either an '@handle' (LTR, the default) or a free-form name someone
+    picked via /setname (could be Arabic). Every OTHER string drawn on
+    the card is written by us and is unambiguously one or the other."""
+    return "rtl" if any("؀" <= ch <= "ۿ" for ch in text) else "ltr"
+
+
+_CARD_FONT_CACHE: dict = {}
+
+
+def _card_font(weight: str, size: int):
+    key = (weight, size)
+    if key not in _CARD_FONT_CACHE:
+        filename = "Tajawal-Bold.ttf" if weight == "bold" else "Tajawal-Regular.ttf"
+        # layout_engine=RAQM: real OpenType shaping (HarfBuzz) from the
+        # font's GSUB table — see the CARD_IMAGE_AVAILABLE comment above
+        # for why this replaced a manual arabic_reshaper/bidi pre-pass.
+        _CARD_FONT_CACHE[key] = ImageFont.truetype(
+            os.path.join(FONT_DIR, filename), size, layout_engine=ImageFont.Layout.RAQM
+        )
+    return _CARD_FONT_CACHE[key]
+
+
+def _card_text(draw, xy, text: str, font, fill):
+    draw.text(xy, text, font=font, fill=fill, anchor="mm", direction=_card_direction(text))
+
+
+def _card_background(size: int = 1080):
+    """Navy base + a few soft blurred color blobs, approximating the
+    website's CSS radial-gradient glow (--accent/--accent-2/--accent-3)
+    since PIL has no CSS gradients — same color stops, different tool."""
+    bg = Image.new("RGB", (size, size), (20, 53, 80))  # --bg
+    glow = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    gdraw = ImageDraw.Draw(glow)
+    radius = int(size * 0.42)
+    blobs = [
+        (int(size * 0.15), int(size * 0.08), (255, 198, 92, 110)),  # --accent (amber)
+        (int(size * 0.90), int(size * 0.12), (108, 192, 255, 110)),  # --accent-3 (blue)
+        (int(size * 0.50), int(size * 0.98), (62, 238, 184, 90)),  # --accent-2 (teal)
+    ]
+    for cx, cy, color in blobs:
+        gdraw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=color)
+    glow = glow.filter(ImageFilter.GaussianBlur(radius=size // 6))
+    return Image.alpha_composite(bg.convert("RGBA"), glow).convert("RGB")
+
+
+def _draw_tree(draw, cx: int, baseline: int, scale: float = 1.0):
+    """A small stand-in for the 🌲 emoji used everywhere else in the bot's
+    text messages — Tajawal (and every other font tried) has no emoji
+    glyphs, so drawing the real emoji as PIL text renders a blank tofu
+    box. Same three-canopy-blob motif as the website's forest SVG."""
+    trunk_w, trunk_h = int(10 * scale), int(34 * scale)
+    draw.rectangle(
+        (cx - trunk_w // 2, baseline - trunk_h, cx + trunk_w // 2, baseline),
+        fill=(92, 70, 50),
+    )
+    r = int(46 * scale)
+    canopy_cy = baseline - trunk_h - int(r * 0.6)
+    for (ox, oy), color in zip(
+        [(0, 0), (-int(r * 0.55), int(r * 0.25)), (int(r * 0.55), int(r * 0.25))],
+        [(227, 168, 59), (163, 201, 168), (127, 182, 140)],
+    ):
+        draw.ellipse(
+            (cx + ox - r, canopy_cy + oy - r, cx + ox + r, canopy_cy + oy + r),
+            fill=color,
+        )
+
+
+def _draw_mini_bars(draw, series: list[dict], x0: float, y0: float, width: float, height: float):
+    """A small last-N-days bar chart, pure vector (no text/font risk)."""
+    n = len(series)
+    if n == 0:
+        return
+    gap = 6
+    bar_w = (width - gap * (n - 1)) / n
+    max_m = max((p["minutes"] for p in series), default=0) or 1
+    for i, p in enumerate(series):
+        bh = max(4, height * (p["minutes"] / max_m)) if p["minutes"] else 4
+        x = x0 + i * (bar_w + gap)
+        color = (62, 238, 184) if p["minutes"] else (50, 82, 108)
+        draw.rounded_rectangle(
+            (x, y0 + height - bh, x + bar_w, y0 + height),
+            radius=min(4, bar_w / 2),
+            fill=color,
+        )
+
+
+def generate_stat_card_image(user_id: int):
+    """Renders /mycard's shareable PNG — the same stats /me already sends
+    as text, but as an actual image sized for a Telegram/WhatsApp status
+    or story, which a text message can't be. Reuses every existing stat
+    helper (total_minutes, current_streak, level_for_total/level_title_for,
+    daily_minutes_series) instead of recomputing anything. Returns None if
+    the user isn't registered."""
+    registered = get_user(user_id)
+    if not registered:
+        return None
+
+    size = 1080
+    cx = size // 2
+    img = _card_background(size)
+    draw = ImageDraw.Draw(img)
+
+    _draw_tree(draw, cx, 190)
+    _card_text(draw, (cx, 255), "غابة الطب", _card_font("bold", 56), (255, 198, 92))
+    _card_text(draw, (cx, 310), "بطاقة إنجاز", _card_font("regular", 28), (195, 221, 240))
+
+    _card_text(draw, (cx, 410), registered["display_name"], _card_font("bold", 46), (255, 250, 240))
+    if registered["batch"]:
+        _card_text(draw, (cx, 460), registered["batch"], _card_font("regular", 28), (195, 221, 240))
+    if registered["founder"]:
+        _card_text(draw, (cx, 500), "رائد الغابة", _card_font("regular", 26), (62, 238, 184))
+
+    total = total_minutes(user_id)
+    streak = current_streak(user_id)
+    level = level_for_total(total)
+    # level_title_for() returns an emoji-prefixed string ("💎 ماسي") meant
+    # for Telegram text messages — Tajawal has no emoji glyphs (same issue
+    # as the 🌲 tree above), so only the Arabic name part is drawn here.
+    title = level_title_for(level).split(" ", 1)[-1]
+
+    _card_text(draw, (cx, 610), str(total // 60), _card_font("bold", 140), (255, 198, 92))
+    _card_text(draw, (cx, 700), "ساعة تركيز إجمالية", _card_font("regular", 32), (195, 221, 240))
+
+    _card_text(draw, (cx, 770), f"Lv{level} · {title}", _card_font("bold", 36), (108, 192, 255))
+    _card_text(draw, (cx, 815), f"ستريك {streak} يوم", _card_font("regular", 32), (255, 250, 240))
+
+    series = daily_minutes_series(user_id, days=14)
+    _draw_mini_bars(draw, series, x0=size * 0.12, y0=890, width=size * 0.76, height=100)
+    _card_text(draw, (cx, 1010), "آخر 14 يوم", _card_font("regular", 24), (195, 221, 240))
+
+    _card_text(draw, (cx, 1055), "#غابة_الطب", _card_font("regular", 24), (255, 198, 92))
+
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+async def cmd_mycard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mycard — a shareable PNG version of /me, sized for posting to a
+    status/story. A SEPARATE command rather than changing /me's existing
+    (already-tested, already-shipped) text output — nothing about /me
+    changes."""
+    user = update.effective_user
+    if not CARD_IMAGE_AVAILABLE:
+        await update.message.reply_text("ميزة البطاقة غير متوفرة حاليًا على السيرفر.")
+        return
+    if not get_user(user.id):
+        await update.message.reply_text("سجّل نفسك أولًا: /register Med25")
+        return
+    buf = generate_stat_card_image(user.id)
+    await update.message.reply_photo(
+        photo=buf,
+        caption="🌲 بطاقتك جاهزة للمشاركة! شاركها بالستوري وتحدى أصحابك 💪\n#غابة_الطب",
+    )
 
 
 COMPARE_VERDICTS_AHEAD = [
@@ -2925,6 +3170,42 @@ def render_schedule_message(sched: dict) -> str:
 STREAK_BREAK_THRESHOLD = 7  # only nudge for a streak that was actually meaningful
 
 
+async def job_streak_save_nudge(context: ContextTypes.DEFAULT_TYPE):
+    """Runs once in the evening, BEFORE the day rolls over — the proactive
+    counterpart to job_check_streak_breaks below (which only reports a
+    break AFTER it already happened, the next morning). Anyone with a
+    real (7+ day) streak who hasn't logged anything yet today gets ONE
+    gentle private reminder while there's still time to save it. Deduped
+    via streak_nudges_sent so a job-queue restart can't double-send the
+    same day's nudge."""
+    today = local_today()
+    yesterday = today - timedelta(days=1)
+
+    conn = db()
+    users = conn.execute("SELECT user_id FROM users").fetchall()
+    conn.close()
+
+    for u in users:
+        streak_at_risk = current_streak(u["user_id"], as_of=yesterday)
+        if streak_at_risk < STREAK_BREAK_THRESHOLD:
+            continue
+        if current_streak(u["user_id"]) > 0:
+            continue  # already logged today — streak isn't actually at risk
+        if was_streak_nudge_sent(u["user_id"], today):
+            continue
+        mark_streak_nudge_sent(u["user_id"], today)
+        try:
+            await context.bot.send_message(
+                chat_id=u["user_id"],
+                text=(
+                    f"🔥 عندك ستريك {streak_at_risk} يوم — لا تخليه ينكسر!\n"
+                    "سجّل جلستك اليوم قبل ما يفوت الوقت 🌱"
+                ),
+            )
+        except Exception:
+            logger.info(f"Could not DM streak-save nudge to user {u['user_id']}")
+
+
 async def job_check_streak_breaks(context: ContextTypes.DEFAULT_TYPE):
     """Once a day, just after midnight: finds anyone whose real streak
     (7+ days) broke yesterday, and sends ONE gentle, private nudge —
@@ -3265,6 +3546,7 @@ def main():
     app.add_handler(CommandHandler("exammode", cmd_exammode))
     app.add_handler(CommandHandler("findpartner", cmd_findpartner))
     app.add_handler(CommandHandler("me", cmd_me))
+    app.add_handler(CommandHandler("mycard", cmd_mycard))
     app.add_handler(CommandHandler("compare", cmd_compare))
     app.add_handler(CommandHandler("motivate", cmd_motivate))
     app.add_handler(CommandHandler("mytree", cmd_mytree))
@@ -3316,6 +3598,9 @@ def main():
     jq.run_daily(job_backup_database, time=dtime(hour=(4 - TZ_OFFSET_HOURS) % 24))
     # Post the day's prayer-aware study-block schedule once, early each morning
     jq.run_daily(job_post_daily_schedule, time=dtime(hour=(0 - TZ_OFFSET_HOURS) % 24, minute=5))
+    # Proactive nudge at 21:00 local, while there's still time tonight to
+    # save a 7+ day streak that hasn't been logged yet today
+    jq.run_daily(job_streak_save_nudge, time=dtime(hour=(21 - TZ_OFFSET_HOURS) % 24))
     # Gentle private nudge for anyone whose 7+ day streak just broke
     jq.run_daily(job_check_streak_breaks, time=dtime(hour=(0 - TZ_OFFSET_HOURS) % 24, minute=15))
     # Check every 5 minutes whether a scheduled block just started
