@@ -578,6 +578,34 @@
 
   .ma-stat span { color: var(--text-dim); }
   .ma-stat b { color: var(--accent-2); font-size: 0.95rem; white-space: nowrap; }
+
+  .ma-heat-wrap {
+    overflow-x: auto;
+    padding: 2px 0 10px;
+  }
+
+  .ma-heat-grid {
+    display: flex;
+    gap: 3px;
+    direction: ltr; /* weeks always flow oldest -> newest, left to right,
+      regardless of page direction — the recognizable GitHub-heatmap
+      reading convention, kept consistent rather than mirrored */
+    width: max-content;
+  }
+
+  .ma-heat-col {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .ma-heat-cell {
+    width: 11px;
+    height: 11px;
+    border-radius: 3px;
+    background: var(--accent-2);
+    flex-shrink: 0;
+  }
 </style>
 </head>
 <body>
@@ -985,6 +1013,27 @@
     `;
   }
 
+  // GitHub-contributions-style heatmap: `series` arrives from the backend
+  // already Sunday-aligned (heatmap_series()), so it can just be sliced
+  // into 7-day chunks here — each chunk is one column/week, each entry in
+  // it one day (Sun..Sat top-to-bottom). Color intensity is scaled to this
+  // user's OWN max day, not some fixed global scale, so someone with a
+  // lighter routine still sees visible contrast instead of one flat shade.
+  function renderHeatmap(series) {
+    if (!series.length) return '';
+    const maxMin = Math.max(...series.map(p => p.minutes), 1);
+    const weeks = [];
+    for (let i = 0; i < series.length; i += 7) weeks.push(series.slice(i, i + 7));
+    const cols = weeks.map(week => {
+      const cells = week.map(p => {
+        const opacity = p.minutes === 0 ? 0.08 : (0.25 + 0.75 * Math.min(1, p.minutes / maxMin)).toFixed(2);
+        return `<div class="ma-heat-cell" style="opacity:${opacity}" title="${p.date} — ${p.minutes} د"></div>`;
+      }).join('');
+      return `<div class="ma-heat-col">${cells}</div>`;
+    }).join('');
+    return `<div class="ma-heat-wrap"><div class="ma-heat-grid">${cols}</div></div>`;
+  }
+
   function renderMyAnalyticsResult(msg) {
     const resultEl = document.getElementById('maResult');
     if (!msg.found) {
@@ -994,6 +1043,12 @@
     const d = msg.data;
     const series = d.daily_series || [];
     const hasAnyActivity = series.some(p => p.minutes > 0);
+    const heatmap = d.heatmap || [];
+    const hasHeatmapActivity = heatmap.some(p => p.minutes > 0);
+
+    const heatmapHtml = hasHeatmapActivity
+      ? `${renderHeatmap(heatmap)}<p class="ma-chart-caption">كل مربع = يوم، كل عمود = أسبوع — آخر ${Math.round(heatmap.length / 7)} أسبوع</p>`
+      : '';
 
     const chartHtml = hasAnyActivity
       ? `<div class="ma-chart">${renderMiniLineChart(series)}</div><p class="ma-chart-caption">الدقائق اليومية — آخر 30 يوم</p>`
@@ -1027,6 +1082,7 @@
 
     resultEl.innerHTML = `
       <p class="ma-name">‎${d.name}${d.batch ? `<span class="row-batch">${d.batch}</span>` : ''}</p>
+      ${heatmapHtml}
       ${chartHtml}
       ${bestLine}
       ${worstLine}
