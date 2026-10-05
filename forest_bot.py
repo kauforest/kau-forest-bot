@@ -1461,6 +1461,208 @@ async def cmd_exammode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ رجعنا للوضع العادي — يلا نكمل المنافسة!")
 
 
+async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/me — a shareable personal stat card, formatted to look good as a
+    screenshot someone would actually want to post. Private-use friendly
+    too, but the format is designed for sharing."""
+    user = update.effective_user
+    registered = get_user(user.id)
+    if not registered:
+        await update.message.reply_text("سجّل نفسك أولًا: /register Med25")
+        return
+    total = total_minutes(user.id)
+    streak = current_streak(user.id)
+    level = level_for_total(total)
+    title = level_title_for(level)
+    xp = total + streak * STREAK_XP_PER_DAY
+    founder_line = " 🏅 رائد الغابة" if registered["founder"] else ""
+
+    card = (
+        f"🌲 بطاقة \u200e{registered['display_name']}{founder_line}\n\n"
+        f"🏷️ {registered['batch']}\n"
+        f"⭐ Lv{level} · {title}\n"
+        f"⏱️ {total} دقيقة ({total // 60} ساعة)\n"
+        f"🔥 ستريك: {streak} يوم\n"
+        f"📊 XP: {xp}\n\n"
+        "#غابة_الطب"
+    )
+    await update.message.reply_text(card)
+
+
+COMPARE_VERDICTS_AHEAD = [
+    "شد حيلك، لسا فيه وقت تلحقه 💪",
+    "لا تستسلم، الفجوة تقدر تردمها 🌱",
+    "عندك شغل — يلا نشوفك تطلع فوق 🔥",
+]
+COMPARE_VERDICTS_BEHIND = [
+    "انت قدامه حاليًا — خله يشوف غبارك 🌲",
+    "واضح انك جاد — كمّل كذا 🚀",
+    "الصدارة تناديك، لا توقف 🏆",
+]
+COMPARE_VERDICTS_TIE = [
+    "متعادلين بالضبط — أي دقيقة زيادة تحسم 😏",
+]
+
+
+async def cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/compare <name> — friendly head-to-head stat comparison, meant to
+    spark some light rivalry/banter rather than being a serious tool."""
+    import random
+
+    user = update.effective_user
+    registered = get_user(user.id)
+    if not registered:
+        await update.message.reply_text("سجّل نفسك أولًا: /register Med25")
+        return
+    if not context.args:
+        await update.message.reply_text("استخدم: /compare اسم_الشخص")
+        return
+
+    query = " ".join(context.args)
+    matches = find_users_by_name(query)
+    if not matches:
+        await update.message.reply_text(f"ما لقيت أحد مسجّل باسم قريب من «{query}».")
+        return
+    if len(matches) > 1:
+        names = "\n".join(f"- {m['display_name']}" for m in matches)
+        await update.message.reply_text(f"لقيت أكثر من واحد يطابق:\n{names}\nحدد الاسم بالضبط.")
+        return
+
+    opponent_id = matches[0]["user_id"]
+    opponent_name = matches[0]["display_name"]
+    if opponent_id == user.id:
+        await update.message.reply_text("ما تقدر تقارن نفسك بنفسك 😄")
+        return
+
+    my_total = total_minutes(user.id)
+    their_total = total_minutes(opponent_id)
+    diff = my_total - their_total
+
+    if diff > 0:
+        verdict = random.choice(COMPARE_VERDICTS_BEHIND)  # "behind" from THEIR perspective = I'm ahead
+    elif diff < 0:
+        verdict = random.choice(COMPARE_VERDICTS_AHEAD)
+    else:
+        verdict = random.choice(COMPARE_VERDICTS_TIE)
+
+    await update.message.reply_text(
+        f"⚔️ \u200e{registered['display_name']} VS \u200e{opponent_name}\n\n"
+        f"أنت: {my_total} دقيقة\n"
+        f"هو: {their_total} دقيقة\n"
+        f"الفرق: {abs(diff)} دقيقة\n\n"
+        f"{verdict}"
+    )
+
+
+MOTIVATE_LINES = [
+    "الدماغ متعب؟ عادي، خذ ٥ دقايق واكمل — الاستمرارية أهم من الكمال 🌱",
+    "كل دقيقة تسجّلها هنا شجرة إضافية بغابتك. ابنيها 🌲",
+    "ما حد يتذكر الساعات اللي ذاكرتها السنة الجاية — بس النتيجة تتذكرها 📈",
+    "لو تحس إنك متأخر عن غيرك، تذكر: أنت بس تنافس نسختك بالأمس 🔥",
+    "استراحة قصيرة أحسن من استمرار مفروض عليك — ارجع لما تحس جاهز 🍃",
+    "الفرق بين اللي يوصل واللي يتوقف؟ يوم زيادة واحد بس 💪",
+]
+
+
+async def cmd_motivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/motivate — a quick, random motivational line. Low-effort,
+    light-touch way to give people a reason to poke at the bot."""
+    import random
+
+    await update.message.reply_text(random.choice(MOTIVATE_LINES))
+
+
+TREE_STAGES = [
+    (1, "🌱", "بذرة لسا تبي تنبت"),
+    (4, "🌿", "نبتة صغيرة بديت تكبر"),
+    (8, "🌳", "شجرة متوسطة، واضح جهدك"),
+    (13, "🌳🌿", "شجرة راسخة بفروع إضافية"),
+    (19, "🌲🌳🌲", "غابة صغيرة بذاتها — مستوى أسطوري"),
+]
+
+
+async def cmd_mytree(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mytree — a visual flourish tied directly to the forest branding;
+    shows a growth-stage emoji based on level, nothing more serious than
+    that, purely for fun/shareability."""
+    user = update.effective_user
+    registered = get_user(user.id)
+    if not registered:
+        await update.message.reply_text("سجّل نفسك أولًا: /register Med25")
+        return
+    total = total_minutes(user.id)
+    level = level_for_total(total)
+    stage_emoji, stage_desc = TREE_STAGES[0][1], TREE_STAGES[0][2]
+    for threshold, emoji, desc in TREE_STAGES:
+        if level >= threshold:
+            stage_emoji, stage_desc = emoji, desc
+    await update.message.reply_text(
+        f"{stage_emoji}\n\n\u200e{registered['display_name']}\nLv{level} — {stage_desc}"
+    )
+
+
+FUN_FACTS = [
+    "القلب البشري يضخ تقريبًا 7500 لتر دم يوميًا — أكثر من حوض سباحة صغير 🫀",
+    "الكبد هو العضو الوحيد اللي يقدر يعيد تجديد نفسه كامل لو انقطع جزء منه 🔄",
+    "الدماغ يستهلك حوالي 20% من طاقة الجسم، رغم إنه بس 2% من وزنه 🧠",
+    "العظم أقوى من الفولاذ بنفس الوزن تقريبًا، لين درجة معينة من الضغط 🦴",
+    "العين البشرية تقدر تميّز حوالي 10 مليون لون مختلف 👁️",
+    "الخلايا العصبية تقدر توصل إشارات بسرعة توصل 120 متر/ثانية ⚡",
+    "الأمعاء الدقيقة طولها لو فردتها يوصل حوالي 6 أمتار 🌀",
+]
+
+
+async def cmd_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/fact — random light medical trivia, fits the audience, purely
+    for a quick fun read, no pressure to act on it."""
+    import random
+
+    await update.message.reply_text(random.choice(FUN_FACTS))
+
+
+EIGHTBALL_ANSWERS = [
+    "أكيد 💯", "على الأغلب", "مو واضح، جرب تسأل بعدين",
+    "لا أعتقد", "الدلائل تقول لا", "اسأل قلبك 😏",
+    "طبعًا!", "بعيد جدًا", "ركّز بمذاكرتك أول، بعدين نتكلم 📚",
+]
+
+
+async def cmd_8ball(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/8ball <question> — classic magic-8-ball novelty, zero study
+    pressure, pure fun/curiosity bait."""
+    import random
+
+    await update.message.reply_text(random.choice(EIGHTBALL_ANSWERS))
+
+
+async def cmd_coffee(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/coffee <name> — sends someone a small public encouragement,
+    meant to build warmth between people rather than being about stats
+    at all."""
+    user = update.effective_user
+    sender = get_user(user.id)
+    if not sender:
+        await update.message.reply_text("سجّل نفسك أولًا: /register Med25")
+        return
+    if not context.args:
+        await update.message.reply_text("استخدم: /coffee اسم_الشخص")
+        return
+    query = " ".join(context.args)
+    matches = find_users_by_name(query)
+    if not matches:
+        await update.message.reply_text(f"ما لقيت أحد مسجّل باسم قريب من «{query}».")
+        return
+    if len(matches) > 1:
+        names = "\n".join(f"- {m['display_name']}" for m in matches)
+        await update.message.reply_text(f"لقيت أكثر من واحد يطابق:\n{names}\nحدد الاسم بالضبط.")
+        return
+    target_name = matches[0]["display_name"]
+    await update.message.reply_text(
+        f"☕ \u200e{sender['display_name']} بعث قهوة معنوية لـ \u200e{target_name}!\n"
+        "استمر، أنت أقرب من ما تتخيل 🌱"
+    )
+
+
 async def cmd_findpartner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/findpartner رياضيات — finds someone else who logged the same tag
     recently. Prefers a same-batch match (same curriculum, most useful),
@@ -2853,6 +3055,13 @@ def main():
     app.add_handler(CommandHandler("setcollegehours", cmd_setcollegehours))
     app.add_handler(CommandHandler("exammode", cmd_exammode))
     app.add_handler(CommandHandler("findpartner", cmd_findpartner))
+    app.add_handler(CommandHandler("me", cmd_me))
+    app.add_handler(CommandHandler("compare", cmd_compare))
+    app.add_handler(CommandHandler("motivate", cmd_motivate))
+    app.add_handler(CommandHandler("mytree", cmd_mytree))
+    app.add_handler(CommandHandler("fact", cmd_fact))
+    app.add_handler(CommandHandler("8ball", cmd_8ball))
+    app.add_handler(CommandHandler("coffee", cmd_coffee))
     app.add_handler(CommandHandler("log", cmd_log))
     app.add_handler(CommandHandler("strike", cmd_strike))
     app.add_handler(CommandHandler("strikes", cmd_strikes))
