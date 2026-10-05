@@ -2609,6 +2609,7 @@ PRAYER_BUFFER_AFTER_MIN = 40  # gap after, enough time to actually pray before t
 MAGHRIB_BUFFER_AFTER_MIN = 30  # Maghrib specifically gets a shorter gap than the other prayers
 JUMUAH_BUFFER_AFTER_MIN = 75  # Friday Dhuhr = Jumu'ah: khutbah + prayer runs much longer than a normal Dhuhr
 MIN_SHORT_SESSION_MIN = 10  # leftover time shorter than this isn't worth its own session, just skip it
+MERGE_SHORT_SESSION_MIN = 30  # leftover shorter than this gets merged into the previous block instead of standing alone
 STUDY_BLOCK_MIN = 60
 STUDY_BREAK_MIN = 10
 # Saudi weekend (Fri/Sat) — no college, so fewer, longer blocks instead of
@@ -2739,10 +2740,16 @@ def build_study_schedule(for_date: date) -> tuple[list[tuple[datetime, datetime]
             short_end = _floor_5min(overlap[0])  # never later than the real prayer start
             short_duration = (short_end - cursor).total_seconds() / 60
             if short_duration >= MIN_SHORT_SESSION_MIN:
-                if pending_label:
-                    gap_labels[len(blocks)] = pending_label
-                    pending_label = None
-                blocks.append((cursor, short_end))
+                if short_duration < MERGE_SHORT_SESSION_MIN and blocks:
+                    # Too short to stand alone — absorb into the previous block
+                    # instead, extending it right up to prayer time.
+                    prev_start, _ = blocks[-1]
+                    blocks[-1] = (prev_start, short_end)
+                else:
+                    if pending_label:
+                        gap_labels[len(blocks)] = pending_label
+                        pending_label = None
+                    blocks.append((cursor, short_end))
             pending_label = overlap[2]
             cursor = _ceil_5min(overlap[1])  # resets the grid cleanly — never earlier than safe
             continue
