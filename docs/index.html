@@ -773,7 +773,11 @@
   }
 
   function renderChips() {
-    const batches = Object.keys(DATA.weekly_by_batch || {});
+    // Prefer the always-complete batch list from the backend so a batch
+    // with zero sessions this week doesn't just vanish from the filter
+    // entirely — fall back to weekly_by_batch's keys only for older
+    // cached data that predates this field.
+    const batches = DATA.all_batches || Object.keys(DATA.weekly_by_batch || {});
     const chipsEl = document.getElementById('chips');
     const all = ['الكل', ...batches];
     chipsEl.innerHTML = all.map(b =>
