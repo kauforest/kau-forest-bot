@@ -3184,8 +3184,10 @@ def main():
     jq.run_daily(job_post_daily_schedule, time=dtime(hour=(0 - TZ_OFFSET_HOURS) % 24, minute=5))
     # Gentle private nudge for anyone whose 7+ day streak just broke
     jq.run_daily(job_check_streak_breaks, time=dtime(hour=(0 - TZ_OFFSET_HOURS) % 24, minute=15))
-    # Check every 5 minutes whether a scheduled block just started
-    jq.run_repeating(job_check_schedule_pings, interval=300, first=30)
+    # Check every minute whether a scheduled block is about to start — a 5-min
+    # interval caused the ping to arrive just 1 min before (not 5) because the
+    # job tick landed at the tail end of the 5-min window every time.
+    jq.run_repeating(job_check_schedule_pings, interval=60, first=30)
     jq.run_repeating(job_auto_complete_sessions, interval=300, first=45)
 
     logger.info("Bot starting...")
