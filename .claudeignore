@@ -1,0 +1,37 @@
+# Binary files — no point reading these
+assets/fonts/*.ttf
+assets/fonts/*.otf
+
+# Database backups — never read these (sensitive real user data)
+backups/
+*.db
+*.sqlite
+*.sqlite3
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Git internals
+.git/
+
+# Logs
+*.log
+logs/
+
+# Environment files (secrets)
+.env
+.env.*
+
+# Node (if ever added)
+node_modules/
+dist/
+build/
+.next/
+
+# OS junk
+.DS_Store
+Thumbs.db
