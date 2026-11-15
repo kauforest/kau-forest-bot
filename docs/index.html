@@ -507,39 +507,25 @@
     margin-bottom: 22px;
   }
 
-  .ma-search {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 18px;
-  }
-
-  .ma-input {
-    flex: 1;
-    min-width: 0;
-    background: var(--panel);
-    border: 1px solid var(--line);
-    color: var(--text);
-    font-family: 'Tajawal', sans-serif;
+  .ma-howto {
+    text-align: center;
+    color: var(--text-dim);
     font-size: 0.95rem;
-    padding: 10px 14px;
-    border-radius: 999px;
-    outline: none;
+    line-height: 1.9;
+    margin: 0 0 18px;
   }
+  .ma-howto b { color: var(--accent-2); }
 
-  .ma-input::placeholder { color: var(--text-dim); }
-  .ma-input:focus { border-color: var(--accent-3); box-shadow: 0 0 0 2px var(--accent-3-glow); }
-
-  .ma-submit {
+  .ma-forget {
+    display: block;
+    margin: 18px auto 0;
+    background: none;
     border: none;
-    background: linear-gradient(135deg, var(--accent-2), var(--accent));
-    color: #0a1e2e;
+    color: var(--text-dim);
     font-family: 'Tajawal', sans-serif;
-    font-weight: 700;
-    font-size: 0.9rem;
-    padding: 0 20px;
-    border-radius: 999px;
+    font-size: 0.82rem;
+    text-decoration: underline;
     cursor: pointer;
-    flex-shrink: 0;
   }
 
   .ma-name {
@@ -644,11 +630,12 @@
 
     <div class="section" id="myAnalyticsSection" style="display:none">
       <p class="section-title">📊 تحليلاتي</p>
-      <div class="ma-search">
-        <input type="text" id="maUsernameInput" class="ma-input" dir="ltr" placeholder="@يوزرك_بتيليجرام" maxlength="64">
-        <button class="ma-submit" id="maSubmitBtn">عرض</button>
-      </div>
+      <p class="ma-howto" id="maHowto">
+        🔒 تحليلاتك خاصة فيك.<br>
+        أرسل <bdi dir="ltr"><b>/mylink</b></bdi> للبوت بالخاص، وافتح الرابط اللي يرسله لك.
+      </p>
       <div id="maResult"></div>
+      <button class="ma-forget" id="maForgetBtn" style="display:none">إخفاء تحليلاتي من هذا الجهاز</button>
     </div>
 
     <div class="tabs" id="tabs">
@@ -943,39 +930,84 @@
   }
 
   // ----- تحليلاتي (My Analytics) -----
-  // Looks up one user's own daily pattern by Telegram @username, no login —
-  // same no-auth philosophy as the rest of the site (which already shows
-  // everyone's name + minutes on the public leaderboard above). Answered
-  // over the same live WebSocket connection used for leaderboard updates
-  // (see connectLiveUpdates below): the browser sends a small request and
-  // the bot answers it directly, privately, instead of this riding on the
-  // broadcast leaderboard payload or the static data.json (which is
-  // committed to the public repo — see CLAUDE.md security notes).
-  document.getElementById('maToggleBtn').addEventListener('click', () => {
-    const sec = document.getElementById('myAnalyticsSection');
-    sec.style.display = sec.style.display === 'none' ? 'block' : 'none';
-  });
+  // Private: a member's analytics only open with their own secret token,
+  // which the bot sends them with /mylink (in a private chat). The token
+  // arrives in the URL #fragment (never sent to GitHub Pages), is moved
+  // into this browser's storage, and the fragment is wiped from the
+  // address bar so a screenshot or copied URL doesn't leak it.
+  // Answered over the live WebSocket, directly to this socket only.
+  const MA_TOKEN_KEY = 'forest_ma_token';
+  let maPending = false;
 
-  function submitMyAnalytics() {
-    const input = document.getElementById('maUsernameInput');
-    const resultEl = document.getElementById('maResult');
-    const username = input.value.trim();
-    if (!username) {
-      resultEl.innerHTML = '<p class="empty">اكتب يوزرك بتيليجرام أول.</p>';
-      return;
-    }
-    if (!window.__liveSocket || window.__liveSocket.readyState !== WebSocket.OPEN) {
-      resultEl.innerHTML = '<p class="empty">الاتصال المباشر غير متوفر حاليًا — جرب تحدّث الصفحة بعد شوي.</p>';
-      return;
-    }
-    resultEl.innerHTML = '<p class="empty">جاري البحث...</p>';
-    window.__liveSocket.send(JSON.stringify({ type: 'personal_analytics', username }));
+  function maGetStoredToken() {
+    try { return localStorage.getItem(MA_TOKEN_KEY); } catch (e) { return null; }
+  }
+  function maStoreToken(t) {
+    try { localStorage.setItem(MA_TOKEN_KEY, t); } catch (e) {}
+  }
+  function maClearToken() {
+    try { localStorage.removeItem(MA_TOKEN_KEY); } catch (e) {}
   }
 
-  document.getElementById('maSubmitBtn').addEventListener('click', submitMyAnalytics);
-  document.getElementById('maUsernameInput').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') submitMyAnalytics();
+  function maTokenFromHash() {
+    const m = (location.hash || '').match(/(?:^#|&)me=([A-Za-z0-9_-]{16,64})/);
+    return m ? m[1] : null;
+  }
+
+  function maShowSection() {
+    document.getElementById('myAnalyticsSection').style.display = 'block';
+  }
+
+  function maShowHowto(message) {
+    document.getElementById('maHowto').style.display = 'block';
+    document.getElementById('maForgetBtn').style.display = 'none';
+    document.getElementById('maResult').innerHTML = message ? `<p class="empty">${message}</p>` : '';
+  }
+
+  function requestMyAnalytics() {
+    const token = maGetStoredToken();
+    if (!token) {
+      maShowHowto('');
+      return;
+    }
+    const resultEl = document.getElementById('maResult');
+    if (!window.__liveSocket || window.__liveSocket.readyState !== WebSocket.OPEN) {
+      maPending = true; // sent as soon as the live connection opens
+      resultEl.innerHTML = '<p class="empty">جاري الاتصال...</p>';
+      return;
+    }
+    maPending = false;
+    resultEl.innerHTML = '<p class="empty">جاري التحميل...</p>';
+    window.__liveSocket.send(JSON.stringify({ type: 'personal_analytics', token }));
+  }
+
+  document.getElementById('maToggleBtn').addEventListener('click', () => {
+    const sec = document.getElementById('myAnalyticsSection');
+    if (sec.style.display === 'none') {
+      maShowSection();
+      requestMyAnalytics();
+    } else {
+      sec.style.display = 'none';
+    }
   });
+
+  document.getElementById('maForgetBtn').addEventListener('click', () => {
+    maClearToken();
+    maShowHowto('تم — تحليلاتك ما عادت تظهر على هذا الجهاز.');
+  });
+
+  // Arrived from a /mylink link? Save the token, clean the URL, open the section.
+  function maInitFromLink() {
+    const token = maTokenFromHash();
+    if (!token) return;
+    maStoreToken(token);
+    try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+    maShowSection();
+    requestMyAnalytics();
+  }
+  maInitFromLink();
+  // Also when the site is already open in this tab and the link is tapped.
+  window.addEventListener('hashchange', maInitFromLink);
 
   // Arabic month names, used instead of the raw ISO "YYYY-MM-DD" string:
   // a dash-separated numeric date inside RTL text visually reorders its
@@ -1037,9 +1069,12 @@
   function renderMyAnalyticsResult(msg) {
     const resultEl = document.getElementById('maResult');
     if (!msg.found) {
-      resultEl.innerHTML = '<p class="empty">ما لقيت حساب مسجّل بهذا اليوزر. تأكد من كتابته صح، أو إنك مسجّل بالبوت أصلًا (/register).</p>';
+      maClearToken();
+      maShowHowto('الرابط هذا قديم أو غير صحيح — أرسل <bdi dir="ltr">/mylink</bdi> للبوت بالخاص عشان ياخذ لك رابط جديد.');
       return;
     }
+    document.getElementById('maHowto').style.display = 'none';
+    document.getElementById('maForgetBtn').style.display = 'block';
     const d = msg.data;
     const series = d.daily_series || [];
     const hasAnyActivity = series.some(p => p.minutes > 0);
@@ -1147,7 +1182,10 @@
       return;
     }
     window.__liveSocket = ws;
-    ws.onopen = () => { window.__liveConnected = true; };
+    ws.onopen = () => {
+      window.__liveConnected = true;
+      if (maPending) requestMyAnalytics();
+    };
     ws.onmessage = (event) => {
       let msg;
       try {
@@ -1156,7 +1194,7 @@
         return; // ignore malformed frame
       }
       // The leaderboard broadcast is a plain data object; a personal-analytics
-      // reply (see submitMyAnalytics above) is tagged so it never gets
+      // reply (see requestMyAnalytics above) is tagged so it never gets
       // mistaken for a full leaderboard refresh (and vice versa).
       if (msg && msg.type === 'personal_analytics') {
         renderMyAnalyticsResult(msg);
