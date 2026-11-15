@@ -22,7 +22,8 @@ Launched publicly Oct 3, 2026. Group has 100+ real members. **Treat every change
 BOT_TOKEN, GROUP_CHAT_ID, TZ_OFFSET_HOURS=3, MANAGER_IDS, LAUNCH_DATE
 DB_PATH=/data/forest.db
 GITHUB_TOKEN, GITHUB_REPO              # the PUBLIC repo, used for website hosting
-BACKUP_GITHUB_REPO                     # a SEPARATE PRIVATE repo — see Security below
+BACKUP_GITHUB_REPO                     # a SEPARATE PRIVATE repo — see Security below (kauforest/kau-forest-backups)
+SITE_URL                               # optional; base of the /mylink analytics links
 ENABLE_GITHUB_DATA_SYNC                # off by default, see note below
 TOPIC_ACHIEVEMENTS_ID, TOPIC_SESSIONS_ID, TOPIC_CHAT_ID, TOPIC_SUGGESTIONS_ID
 PRAYER_CITY=Jeddah, PRAYER_COUNTRY=SaudiArabia
@@ -36,7 +37,7 @@ SUGGESTION_COOLDOWN_SECONDS=120
 
 `kau-forest-bot` is a **PUBLIC** repo (required for free GitHub Pages). **Never push real user data, raw database files, or secrets to it.**
 
-The automated DB backup (`backup_database_to_github()`) refuses to run at all unless `BACKUP_GITHUB_REPO` — a genuinely separate **private** repo — is explicitly configured. This was a deliberate fix after the database was briefly pushed to the public repo's `backups/` folder by mistake. If `BACKUP_GITHUB_REPO` is unset, confirm with Husain whether that cleanup (private repo creation + token scoping + variable set) was ever completed before assuming backups are safe.
+The automated DB backup (`backup_database_to_github()`) refuses to run at all unless `BACKUP_GITHUB_REPO` — a genuinely separate **private** repo — is explicitly configured. This was a deliberate fix after the database was briefly pushed to the public repo's `backups/` folder by mistake. Since 2026-11-15 backups go to the private repo `kauforest/kau-forest-backups` every night at 04:00, and before every upload the bot asks GitHub whether that repo is really private (and refuses if it's public or equals `GITHUB_REPO`). `GITHUB_TOKEN` is a fine-grained token scoped ONLY to the backup repo (Contents read/write), expiring ~Nov 2027 — it cannot write to the public repo. Managers can test with `/backupnow` (private chat). Old DB copies still exist in this public repo's git history (commits d34fa90, 477b485).
 
 ## Known gotchas — do not rediscover these
 
@@ -48,6 +49,9 @@ The automated DB backup (`backup_database_to_github()`) refuses to run at all un
 6. **Telegram supergroup migration**: if the group ever gets converted to a "supergroup" (e.g. by enabling Topics), it gets a **new chat ID** — `GROUP_CHAT_ID` must be updated or every group-facing bot action silently fails with `ChatMigrated`.
 7. **Daily-card OCR sanity check exists for a reason**: a real screenshot was once misread as 1,380 minutes in one day. `MAX_DAILY_CARD_MINUTES` rejects anything above a realistic daily cap — don't remove this safeguard.
 8. **The display name shown publicly must always be the registered `display_name`** (their Telegram `@username` or self-chosen `/setname`), never `user.first_name` (their real Telegram name). This was a real privacy bug fixed across level-up announcements, milestones, `/stats`, and `/log` — check any NEW public-facing message doesn't reintroduce it.
+9. **python-telegram-bot 20+ numbers weekdays 0=Sunday … 6=Saturday** in `run_daily(days=...)` — NOT Python's Monday=0. `days=(5,)` is FRIDAY. This was a real bug: the "Saturday" weekly leaderboard posted on Friday until 2026-11-15.
+10. **Never replace `forest_bot.py` wholesale with a copy from a chat.** On 2026-10-06/08 that silently deleted three merged PRs. Work on a branch, run the tests, open a PR.
+11. **«تحليلاتي» is private by design.** The website only answers with a member's secret token from `/mylink` (table `analytics_tokens`); username lookups are refused. Never send personal analytics through the broadcast payload or `data.json`.
 
 ## Features already built
 
@@ -62,6 +66,9 @@ The automated DB backup (`backup_database_to_github()`) refuses to run at all un
 - Telegram Topics (forum mode) routing: achievements/sessions/chat/suggestions each have their own topic, closed to non-admins where appropriate
 - A per-topic suggestion-spam cooldown (Telegram has no native per-topic slow mode — this is bot-enforced)
 - `/me`, `/compare`, `/motivate`, `/mytree`, `/coffee` — light social/fun commands (NOT `/8ball` or `/fact` — explicitly removed, don't re-add without being asked)
+- `/mycard` (shareable PNG, needs `libfribidi0` in the Dockerfile), `/mylink` (private «تحليلاتي» link), weekly personal recap DM (Sun 10:00), monthly titles نجم الشهر / رواد الشهر (1st, 09:15), evening streak-save nudge (21:00) — restored 2026-11-15 after the overwrite
+- Anonymous daily poll (17:00)
+- `/backupnow` (manager, private chat) — runs the private DB backup immediately and reports ✅/❌ with the reason
 - `/strike`, `/strikes`, `/blockmember`, `/unblockmember`, `/setforestname` — built and tested, but **explicitly deprioritized/paused** by Husain ("skip it for now, we'll handle it manually") — don't assume these are in active use
 
 ## User preferences
@@ -77,10 +84,11 @@ The automated DB backup (`backup_database_to_github()`) refuses to run at all un
 - `docs/index.html` — website (served via GitHub Pages from `/docs`)
 - `Dockerfile` — required for the `tesseract-ocr` system package
 - `requirements.txt` — Python deps (notably `websockets`, easy to forget when editing this)
+- `tests/test_bot_offline.py` — run before every PR (fake Telegram + fake GitHub, temp DB)
+- `tests/test_website_e2e.py` — website in headless Chrome against the real WebSocket handler
 - This file (`CLAUDE.md`) — repo root, read automatically every session
 
 ## Before starting new work, it's worth confirming with Husain
 
-- Whether `BACKUP_GITHUB_REPO` cleanup was actually completed (private repo created, token scoped, variable set)
 - Whether schedule posting (`schedule_posting_enabled`) is currently ON or OFF in the live group — don't assume
 - What's actually deployed right now vs. what's been discussed/built in a chat but not yet pushed — given the deployment-lag history, always verify against GitHub directly rather than assuming the latest conversation state matches production
