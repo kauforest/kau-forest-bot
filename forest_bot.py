@@ -145,7 +145,8 @@ SITE_URL = os.environ.get("SITE_URL", "https://kauforest.github.io/kau-forest-bo
 # Shared secret for the Forest auto-host helper running on Husain's PC
 # (forest_host/host_agent.py). Unset = the auto-host feature is off.
 HOST_AGENT_SECRET = os.environ.get("HOST_AGENT_SECRET", "")
-AUTO_HOST_LEAD_MIN = 8  # room link goes out this many minutes before a block (Husain's choice)
+AUTO_HOST_PREP_MIN = 10  # the PC starts preparing the room this many minutes before a block…
+AUTO_HOST_LEAD_MIN = 8   # …and the link is posted exactly this many minutes before (Husain's choice)
 AUTO_HOST_RETRY_SEC = 60  # if <2 people at start time, try once more after 1 minute, then give up
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. "yourname/study-leaderboard" — this is PUBLIC, used for the website
 BACKUP_GITHUB_REPO = os.environ.get("BACKUP_GITHUB_REPO", "")  # MUST be a separate PRIVATE repo — real user data goes here
@@ -3886,13 +3887,28 @@ async def _auto_host_create(context, key: str, start: datetime, end: datetime, m
         _persist_room(context, key, state="create_failed", error=str(res.get("error"))[:200])
         await _notify_managers(context, f"⚠️ الاستضافة التلقائية: ما قدرت أفتح غرفة لفترة {start.strftime('%I:%M %p')}.\nالسبب: {res.get('error')}")
         return
+    _persist_room(context, key, state="ready", code=code)
+    if local_now() >= start - timedelta(minutes=AUTO_HOST_LEAD_MIN):
+        await _auto_host_post(context, key)
+
+
+async def _auto_host_post(context, key: str):
+    """Posts the prepared room's link — exactly AUTO_HOST_LEAD_MIN before the
+    block (the room itself is prepared a couple of minutes earlier)."""
+    sched = _get_today_schedule(context)
+    room = (sched or {}).get("rooms", {}).get(key)
+    if not room or room.get("state") != "ready":
+        return
+    room["state"] = "posting"
+    _save_schedule_state(sched)
+    start, end = datetime.fromisoformat(room["start"]), datetime.fromisoformat(room["end"])
     msg = await context.bot.send_message(
         chat_id=GROUP_CHAT_ID,
-        text=_room_post_text(start, end, minutes, code),
+        text=_room_post_text(start, end, room["minutes"], room["code"]),
         disable_web_page_preview=True,
         **_topic_kwargs(TOPIC_SESSIONS_ID),
     )
-    _persist_room(context, key, state="open", code=code, msg_id=msg.message_id)
+    _persist_room(context, key, state="open", msg_id=msg.message_id)
 
 
 async def _auto_host_start(context, key: str, attempt: int):
@@ -3932,7 +3948,7 @@ async def _auto_host_tick(context, sched: dict, now: datetime) -> set:
         key = start.isoformat()
         room = rooms.get(key)
         if room is None:
-            if agent_connected() and start - timedelta(minutes=AUTO_HOST_LEAD_MIN) <= now < start - timedelta(minutes=1):
+            if agent_connected() and start - timedelta(minutes=AUTO_HOST_PREP_MIN) <= now < start - timedelta(minutes=1):
                 rooms[key] = {"state": "creating", "start": key, "end": end.isoformat(), "minutes": _block_minutes(start, end)}
                 _save_schedule_state(sched)
                 context.application.create_task(
@@ -3953,6 +3969,12 @@ async def _auto_host_tick(context, sched: dict, now: datetime) -> set:
             room["state"] = "failed"
             _save_schedule_state(sched)
             continue
+        if state == "ready" and now >= start - timedelta(minutes=AUTO_HOST_LEAD_MIN):
+            context.application.create_task(_auto_host_post(context, key))
+            continue
+        if state == "posting" and now >= start:
+            room["state"] = "open"  # the post went out but a restart lost the bookkeeping
+            _save_schedule_state(sched)
         if state == "open" and now >= start:
             room["state"] = "starting"
             _save_schedule_state(sched)
@@ -3966,7 +3988,8 @@ async def _auto_host_tick(context, sched: dict, now: datetime) -> set:
 
 async def job_check_schedule_pings(context: ContextTypes.DEFAULT_TYPE):
     """Runs every minute. With the auto-host on (and the PC helper online),
-    a Forest room is opened 8 minutes before each block, its link posted,
+    a Forest room is prepared 10 minutes before each block, its link posted
+    exactly 8 minutes before,
     and the session started exactly at the block time (one retry after a
     minute if fewer than 2 people joined). Otherwise it falls back to the
     old heads-up 5 minutes before each block asking an admin to host."""
