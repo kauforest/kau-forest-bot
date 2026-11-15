@@ -176,6 +176,56 @@ check("daily group poll is anonymous", c.bot.sent and c.bot.sent[0][2].get("is_a
 u, m = upd("private", uid=1); c = ctx(); asyncio.run(fb.cmd_testpoll(u, c))  # uid 1 = manager
 check("/testpoll preview is anonymous too", c.bot.sent and c.bot.sent[0][2].get("is_anonymous") is True)
 
+# ---- 9c. private DB backup + /backupnow (GitHub faked, nothing uploaded) --
+import base64 as _b64
+class FakeResp:
+    def __init__(self, code, body=None): self.status_code, self._b, self.text = code, body or {}, json.dumps(body or {})
+    def json(self): return self._b
+uploads = []
+def fake_github(get_code=404, put_codes=(201,), private=True):
+    codes = list(put_codes)
+    def get(url, **kw):
+        if "/contents/" not in url:
+            return FakeResp(200, {"private": private})
+        return FakeResp(get_code, {"sha": "abc"} if get_code == 200 else {})
+    fb.requests.get = get
+    def put(url, json=None, **kw):
+        uploads.append((url, json)); return FakeResp(codes.pop(0) if codes else 201)
+    fb.requests.put = put
+fb.GITHUB_TOKEN = "fake"; fb.BACKUP_GITHUB_REPO = ""
+check("backup refuses without a private repo set", fb.backup_database_to_github() is False and "BACKUP_GITHUB_REPO" in fb._LAST_GITHUB_ERROR)
+fb.BACKUP_GITHUB_REPO = "kauforest/kau-forest-backups"
+uploads.clear(); fake_github(get_code=404, put_codes=(422, 201))
+ok = fb.backup_database_to_github()
+check("first backup into a brand-new EMPTY repo works", ok and len(uploads) == 2 and "branch" not in uploads[-1][1])
+check("backup goes to the private repo, never the public one", all("kau-forest-backups" in u[0] for u in uploads), uploads[-1][0])
+snap = os.path.join(tmp, "restored.db"); open(snap, "wb").write(_b64.b64decode(uploads[-1][1]["content"]))
+n_backup = sqlite3.connect(snap).execute("select count(*) from sessions").fetchone()[0]
+n_live = fb.db().execute("select count(*) from sessions").fetchone()[0]
+check("backup file is a valid DB with every session", n_backup == n_live, f"{n_backup} sessions")
+uploads.clear(); fake_github(get_code=200, put_codes=(201,))
+check("daily backup updates the same file", fb.backup_database_to_github() and uploads[0][1].get("sha") == "abc")
+uploads.clear(); fake_github(private=False)
+check("REFUSES to back up into a PUBLIC repo", not fb.backup_database_to_github() and not uploads and "PUBLIC" in fb._LAST_GITHUB_ERROR, fb._LAST_GITHUB_ERROR)
+fb.GITHUB_REPO = "kauforest/kau-forest-backups"; uploads.clear(); fake_github()
+check("REFUSES if backup repo = website repo", not fb.backup_database_to_github() and not uploads)
+fb.GITHUB_REPO = "kauforest/kau-forest-bot"
+fake_github(get_code=200, put_codes=(401,))
+check("expired token -> clear reason", not fb.backup_database_to_github() and "expired" in fb._LAST_GITHUB_ERROR, fb._LAST_GITHUB_ERROR)
+fake_github(get_code=200, put_codes=(403,))
+check("no write permission -> clear reason", not fb.backup_database_to_github() and "Read and write" in fb._LAST_GITHUB_ERROR, fb._LAST_GITHUB_ERROR)
+u, m = upd("private", uid=1001); asyncio.run(fb.cmd_backupnow(u, ctx()))
+check("/backupnow is managers-only", "للمنظّمين" in m.replies[0][0])
+u, m = upd("supergroup", uid=1); asyncio.run(fb.cmd_backupnow(u, ctx()))
+check("/backupnow refuses in the group", "بالخاص" in m.replies[0][0])
+fake_github(get_code=404, put_codes=(201,))
+u, m = upd("private", uid=1); asyncio.run(fb.cmd_backupnow(u, ctx()))
+check("/backupnow success message", "✅" in m.replies[-1][0], m.replies[-1][0].splitlines()[0])
+fake_github(get_code=200, put_codes=(401,))
+u, m = upd("private", uid=1); asyncio.run(fb.cmd_backupnow(u, ctx()))
+check("/backupnow failure explains why", "❌" in m.replies[-1][0] and "401" in m.replies[-1][0], m.replies[-1][0].replace("\n", " | "))
+fb.BACKUP_GITHUB_REPO = ""; fb.GITHUB_TOKEN = ""
+
 # ---- 10. things that were already on main still work -------------------
 check("display_streak still present", fb.display_streak(1003) >= 10, str(fb.display_streak(1003)))
 check("time-window dedup still present", fb.extract_time_window("14:08 - 15:08") == "14:08-15:08")
@@ -189,7 +239,7 @@ Application.run_polling = fake_run_polling
 fb.main()
 app = captured["app"]
 cmds = {c for h in app.handlers[0] if hasattr(h, "commands") for c in h.commands}
-for c_ in ["mycard", "mylink", "findpartner", "me", "stats", "testschedule", "pausescheduleposts"]:
+for c_ in ["mycard", "mylink", "backupnow", "findpartner", "me", "stats", "testschedule", "pausescheduleposts"]:
     check(f"/{c_} registered", c_ in cmds)
 jobs = {j.callback.__name__: j for j in app.job_queue.jobs()}
 for j in ["job_monthly_titles", "job_streak_save_nudge", "job_weekly_personal_recap", "job_auto_complete_sessions"]:
