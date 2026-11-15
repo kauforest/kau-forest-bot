@@ -226,6 +226,140 @@ u, m = upd("private", uid=1); asyncio.run(fb.cmd_backupnow(u, ctx()))
 check("/backupnow failure explains why", "❌" in m.replies[-1][0] and "401" in m.replies[-1][0], m.replies[-1][0].replace("\n", " | "))
 fb.BACKUP_GITHUB_REPO = ""; fb.GITHUB_TOKEN = ""
 
+# ---- 9d. Forest auto-host (fake PC helper, fake Telegram) ---------------
+import asyncio as _aio
+class Sent:
+    def __init__(self): self.msgs = []; self.edits = []; self.n = 100
+    async def send_message(self, chat_id, text, **kw):
+        self.n += 1; self.msgs.append((chat_id, text, kw)); return types.SimpleNamespace(message_id=self.n)
+    async def edit_message_text(self, chat_id, message_id, text, **kw): self.edits.append((message_id, text))
+class App:
+    def __init__(self): self.bot_data = {}; self.tasks = []
+    def create_task(self, coro): self.tasks.append(_aio.ensure_future(coro))
+class FakeAgent:
+    """Answers bot commands like host_agent.py would."""
+    def __init__(self, start_results): self.cmds = []; self.start_results = list(start_results)
+    async def send(self, raw):
+        m = json.loads(raw)
+        if m.get("type") != "cmd":
+            return
+        self.cmds.append(m["action"])
+        if m["action"] == "create_room": res = {"ok": True, "code": "ABCD123G"}
+        elif m["action"] == "start_room": res = self.start_results.pop(0)
+        else: res = {"ok": True, "closed": True}
+        _aio.get_running_loop().call_soon(lambda: _aio.ensure_future(
+            fb._handle_agent_message(self, {"type": "cmd_result", "id": m["id"], **res})))
+    async def close(self): pass
+
+async def auto_host_tests():
+    fb.GROUP_CHAT_ID = "-100123"; fb.TOPIC_SESSIONS_ID = "55"
+    fb.set_setting("schedule_posting_enabled", "true")
+    real_now = fb.local_now
+
+    def make_ctx():
+        c = types.SimpleNamespace(bot=Sent(), application=App(), args=[])
+        return c
+    async def settle(c):
+        for _ in range(5):
+            await _aio.sleep(0)
+            if c.application.tasks:
+                await _aio.gather(*c.application.tasks); c.application.tasks.clear()
+
+    # secret handling
+    fb.HOST_AGENT_SECRET = ""
+    ag = FakeAgent([])
+    await fb._handle_agent_message(ag, {"type": "agent_hello", "secret": "x"})
+    check("auto-host: no secret set -> helper refused", not fb.agent_connected())
+    fb.HOST_AGENT_SECRET = "s3cret-value-xyz"
+    await fb._handle_agent_message(ag, {"type": "agent_hello", "secret": "wrong"})
+    check("auto-host: wrong secret -> refused", not fb.agent_connected())
+
+    def plan_day(c, minutes_until_start):
+        base = real_now().replace(second=0, microsecond=0)
+        st = base + timedelta(minutes=minutes_until_start)
+        sched = {"date": fb.local_today().isoformat(), "blocks": [(st, st + timedelta(minutes=60))],
+                 "gap_labels": {}, "pinged": set(), "done": set(), "link_sent": set(), "rooms": {}}
+        c.application.bot_data["today_schedule"] = sched; fb._save_schedule_state(sched)
+        return base, st
+
+    # --- scenario A: refused at start, starts on the 1-minute retry
+    c = make_ctx(); base, st = plan_day(c, 7)
+    agA = FakeAgent([{"ok": True, "started": False, "members": 0}, {"ok": True, "started": True, "members": 2}])
+    await fb._handle_agent_message(agA, {"type": "agent_hello", "secret": "s3cret-value-xyz"})
+    check("auto-host: correct secret -> helper connected", fb.agent_connected())
+    fb.set_setting("auto_host_enabled", "true")
+    fb.local_now = lambda: base
+    await fb.job_check_schedule_pings(c); await settle(c)
+    post = [m for m in c.bot.msgs if "forestapp.cc/join-room?token=ABCD123G" in m[1]]
+    check("auto-host: room link posted 8 min before (7 min left)", len(post) == 1 and post[0][2].get("message_thread_id") == 55,
+          post[0][1].splitlines()[0] if post else str(c.bot.msgs))
+    check("auto-host: old 'an admin shares a link' ping NOT sent", not any("أحد الأدمنز" in m[1] for m in c.bot.msgs))
+    check("auto-host: code shown with LRM, no early start", "\u200eABCD123G" in post[0][1] and "start_room" not in agA.cmds)
+    fb.local_now = lambda: st - timedelta(minutes=3)
+    await fb.job_check_schedule_pings(c); await settle(c)
+    check("auto-host: still waits before start time", agA.cmds.count("start_room") == 0 and agA.cmds.count("create_room") == 1)
+    fb.local_now = lambda: st
+    await fb.job_check_schedule_pings(c); await settle(c)
+    room = fb._load_schedule_state()["rooms"][st.isoformat()]
+    check("auto-host: <2 people at start -> waits 1 minute", room["state"] == "waiting_retry" and agA.cmds.count("start_room") == 1, room["state"])
+    fb.local_now = lambda: st + timedelta(seconds=30)
+    await fb.job_check_schedule_pings(c); await settle(c)
+    check("auto-host: no retry before the minute is up", agA.cmds.count("start_room") == 1)
+    fb.local_now = lambda: st + timedelta(seconds=65)
+    await fb.job_check_schedule_pings(c); await settle(c)
+    room = fb._load_schedule_state()["rooms"][st.isoformat()]
+    check("auto-host: second try starts the session", room["state"] == "started" and agA.cmds.count("start_room") == 2, room["state"])
+    check("auto-host: post edited to 'started'", any("بدأت الجلسة" in e[1] for e in c.bot.edits))
+    check("auto-host: block will auto-tick ✅", st.isoformat() in fb._load_schedule_state()["link_sent"])
+
+    # --- scenario B: nobody joins -> calm message + room closed
+    c = make_ctx(); base, st = plan_day(c, 6)
+    agB = FakeAgent([{"ok": True, "started": False, "members": 0}, {"ok": True, "started": False, "members": 0}])
+    await fb._handle_agent_message(agB, {"type": "agent_hello", "secret": "s3cret-value-xyz"})
+    for t in (base, st, st + timedelta(seconds=61)):
+        fb.local_now = lambda t=t: t
+        await fb.job_check_schedule_pings(c); await settle(c)
+    room = fb._load_schedule_state()["rooms"][st.isoformat()]
+    check("auto-host: still <2 after retry -> 'not enough' + close", room["state"] == "not_enough" and "close_room" in agB.cmds
+          and any("ما اكتمل العدد" in e[1] for e in c.bot.edits), room["state"])
+
+    # --- scenario C: helper offline -> old manual-host ping as before
+    fb._agent_disconnected(agB)
+    c = make_ctx(); base, st = plan_day(c, 4)
+    fb.local_now = lambda: base
+    await fb.job_check_schedule_pings(c); await settle(c)
+    check("auto-host: helper offline -> falls back to the old ping", any("أحد الأدمنز" in m[1] for m in c.bot.msgs))
+
+    # --- scenario D: auto-host switched off -> old ping
+    agD = FakeAgent([])
+    await fb._handle_agent_message(agD, {"type": "agent_hello", "secret": "s3cret-value-xyz"})
+    fb.set_setting("auto_host_enabled", "false")
+    c = make_ctx(); base, st = plan_day(c, 4)
+    fb.local_now = lambda: base
+    await fb.job_check_schedule_pings(c); await settle(c)
+    check("auto-host: switched off -> no room, old ping", "create_room" not in agD.cmds and any("أحد الأدمنز" in m[1] for m in c.bot.msgs))
+
+    # --- scenario E: group posting kill-switch off -> nothing at all
+    fb.set_setting("auto_host_enabled", "true"); fb.set_setting("schedule_posting_enabled", "false")
+    c = make_ctx(); base, st = plan_day(c, 7)
+    fb.local_now = lambda: base
+    await fb.job_check_schedule_pings(c); await settle(c)
+    check("auto-host: schedule posting paused -> nothing posted", not c.bot.msgs and "create_room" not in agD.cmds)
+    fb.set_setting("schedule_posting_enabled", "true")
+
+    # --- /autohost command
+    um = Msg()
+    u = types.SimpleNamespace(effective_user=types.SimpleNamespace(id=1), effective_chat=types.SimpleNamespace(type="private"), message=um)
+    await fb.cmd_autohost(u, types.SimpleNamespace(args=["off"]))
+    check("/autohost off works + shows helper online", fb.get_setting("auto_host_enabled") == "false" and "🟢" in um.replies[-1][0])
+    u2 = types.SimpleNamespace(effective_user=types.SimpleNamespace(id=1001), effective_chat=types.SimpleNamespace(type="private"), message=Msg())
+    await fb.cmd_autohost(u2, types.SimpleNamespace(args=["on"]))
+    check("/autohost is managers-only", fb.get_setting("auto_host_enabled") == "false")
+    fb._agent_disconnected(agD)
+    fb.local_now = real_now; fb.GROUP_CHAT_ID = "-100123"
+
+_aio.run(auto_host_tests())
+
 # ---- 10. things that were already on main still work -------------------
 check("display_streak still present", fb.display_streak(1003) >= 10, str(fb.display_streak(1003)))
 check("time-window dedup still present", fb.extract_time_window("14:08 - 15:08") == "14:08-15:08")
@@ -239,7 +373,7 @@ Application.run_polling = fake_run_polling
 fb.main()
 app = captured["app"]
 cmds = {c for h in app.handlers[0] if hasattr(h, "commands") for c in h.commands}
-for c_ in ["mycard", "mylink", "backupnow", "findpartner", "me", "stats", "testschedule", "pausescheduleposts"]:
+for c_ in ["mycard", "mylink", "backupnow", "autohost", "testroom", "findpartner", "me", "stats", "testschedule", "pausescheduleposts"]:
     check(f"/{c_} registered", c_ in cmds)
 jobs = {j.callback.__name__: j for j in app.job_queue.jobs()}
 for j in ["job_monthly_titles", "job_streak_save_nudge", "job_weekly_personal_recap", "job_auto_complete_sessions"]:

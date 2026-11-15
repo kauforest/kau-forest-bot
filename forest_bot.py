@@ -27,6 +27,7 @@ screenshots are now the only way to log a session.
 """
 
 import asyncio
+import hmac
 import os
 import re
 import sqlite3
@@ -141,6 +142,11 @@ VALID_BATCHES = ["Med22", "Med23", "Med24", "Med25", "Med26", "Med27"]
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 # Public website address — used to build each member's private «تحليلاتي» link.
 SITE_URL = os.environ.get("SITE_URL", "https://kauforest.github.io/kau-forest-bot/")
+# Shared secret for the Forest auto-host helper running on Husain's PC
+# (forest_host/host_agent.py). Unset = the auto-host feature is off.
+HOST_AGENT_SECRET = os.environ.get("HOST_AGENT_SECRET", "")
+AUTO_HOST_LEAD_MIN = 8  # room link goes out this many minutes before a block (Husain's choice)
+AUTO_HOST_RETRY_SEC = 60  # if <2 people at start time, try once more after 1 minute, then give up
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. "yourname/study-leaderboard" — this is PUBLIC, used for the website
 BACKUP_GITHUB_REPO = os.environ.get("BACKUP_GITHUB_REPO", "")  # MUST be a separate PRIVATE repo — real user data goes here
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
@@ -1356,7 +1362,12 @@ async def _handle_ws_request(websocket, raw_message):
         request = json.loads(raw_message)
     except (ValueError, TypeError):
         return
-    if not isinstance(request, dict) or request.get("type") != "personal_analytics":
+    if not isinstance(request, dict):
+        return
+    if request.get("type") in ("agent_hello", "cmd_result", "agent_event"):
+        await _handle_agent_message(websocket, request)
+        return
+    if request.get("type") != "personal_analytics":
         return
     # Only a private /mylink token opens someone's analytics. Old-style
     # username lookups are refused on purpose (privacy), with a reason the
@@ -1389,6 +1400,89 @@ async def ws_handler(websocket):
         pass
     finally:
         CONNECTED_CLIENTS.discard(websocket)
+        _agent_disconnected(websocket)
+
+
+# ---------------------------------------------------------------------------
+# Forest auto-host: the helper program on Husain's PC (forest_host/host_agent.py)
+# drives the Forest app inside BlueStacks. It connects OUT to this same
+# WebSocket server, proves itself with HOST_AGENT_SECRET, and then takes
+# simple commands: create_room / start_room / close_room / status.
+# The bot stays in charge of WHEN (it knows the schedule); the PC only does HOW.
+# ---------------------------------------------------------------------------
+
+AGENT = {"ws": None, "since": None, "pending": {}, "seq": 0, "info": {}}
+
+
+def agent_connected() -> bool:
+    return AGENT["ws"] is not None
+
+
+async def _handle_agent_message(websocket, msg: dict):
+    if msg.get("type") == "agent_hello":
+        secret = str(msg.get("secret") or "")
+        if not HOST_AGENT_SECRET or not hmac.compare_digest(secret, HOST_AGENT_SECRET):
+            logger.warning("Auto-host: rejected an agent with a wrong/missing secret")
+            try:
+                await websocket.send(json.dumps({"type": "agent_denied"}))
+                await websocket.close()
+            except Exception:
+                pass
+            return
+        old = AGENT["ws"]
+        AGENT.update(ws=websocket, since=local_now(), info={"version": msg.get("version")})
+        CONNECTED_CLIENTS.discard(websocket)  # the agent doesn't need leaderboard broadcasts
+        if old is not None and old is not websocket:
+            try:
+                await old.close()
+            except Exception:
+                pass
+        logger.info("Auto-host: agent connected (version %s)", msg.get("version"))
+        await websocket.send(json.dumps({"type": "agent_ok"}))
+        return
+    if websocket is not AGENT["ws"]:
+        return  # results/events only count from the authenticated agent
+    if msg.get("type") == "cmd_result":
+        fut = AGENT["pending"].pop(str(msg.get("id")), None)
+        if fut and not fut.done():
+            fut.set_result(msg)
+    elif msg.get("type") == "agent_event":
+        logger.info("Auto-host event: %s", msg)
+
+
+def _agent_disconnected(websocket):
+    if websocket is AGENT["ws"]:
+        AGENT["ws"] = None
+        for fut in AGENT["pending"].values():
+            if not fut.done():
+                fut.set_result({"ok": False, "error": "agent disconnected"})
+        AGENT["pending"].clear()
+        logger.warning("Auto-host: agent disconnected")
+
+
+async def agent_call(action: str, timeout: float = 150, **params) -> dict:
+    """Sends one command to the PC helper and waits for its answer.
+    Never raises: on any problem returns {"ok": False, "error": ...}."""
+    ws = AGENT["ws"]
+    if ws is None:
+        return {"ok": False, "error": "agent not connected"}
+    AGENT["seq"] += 1
+    cmd_id = str(AGENT["seq"])
+    fut = asyncio.get_running_loop().create_future()
+    AGENT["pending"][cmd_id] = fut
+    try:
+        await ws.send(json.dumps({"type": "cmd", "id": cmd_id, "action": action, **params}))
+        return await asyncio.wait_for(fut, timeout)
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": f"no answer within {int(timeout)}s"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        AGENT["pending"].pop(cmd_id, None)
+
+
+def forest_join_link(code: str) -> str:
+    return f"https://forestapp.cc/join-room?token={code}"
 
 
 async def start_ws_server(app):
@@ -1717,6 +1811,7 @@ def _save_schedule_state(sched: dict):
             "pinged": list(sched.get("pinged", set())),
             "done": list(sched.get("done", set())),
             "link_sent": list(sched.get("link_sent", set())),
+            "rooms": sched.get("rooms", {}),
         }
         set_setting("today_schedule_state", json.dumps(serializable, ensure_ascii=False))
     except Exception:
@@ -1737,6 +1832,7 @@ def _load_schedule_state() -> dict | None:
             "pinged": set(data.get("pinged", [])),
             "done": set(data.get("done", [])),
             "link_sent": set(data.get("link_sent", [])),
+            "rooms": data.get("rooms", {}),
         }
     except Exception:
         logger.exception("Failed to load persisted schedule state")
@@ -3729,12 +3825,151 @@ async def cmd_nextsession(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def auto_host_enabled() -> bool:
+    return get_setting("auto_host_enabled", "false") == "true"
+
+
+def _block_minutes(start: datetime, end: datetime) -> int:
+    """Forest's timer moves in 5-minute steps, so round the block length to 5."""
+    mins = int(round((end - start).total_seconds() / 60 / 5.0)) * 5
+    return max(10, min(mins, 180))
+
+
+def _room_post_text(start: datetime, end: datetime, minutes: int, code: str) -> str:
+    return (
+        "🌲 غرفة Forest جاهزة للفترة القادمة\n"
+        f"⏰ {start.strftime('%I:%M %p')} – {end.strftime('%I:%M %p')} ({minutes} دقيقة)\n\n"
+        f"👈 اضغط وادخل:\n{forest_join_link(code)}\n"
+        f"🔑 أو بالكود: \u200e{code}\n\n"
+        f"تبدأ الجلسة الساعة {start.strftime('%I:%M %p')} بالضبط — ادخلوا قبلها 🌱"
+    )
+
+
+async def _notify_managers(context, text: str):
+    for mid in MANAGER_IDS:
+        try:
+            await context.bot.send_message(chat_id=mid, text=text)
+        except Exception:
+            logger.info(f"Could not DM manager {mid}")
+
+
+async def _edit_room_post(context, room: dict, extra: str):
+    if not room.get("msg_id"):
+        return
+    base = _room_post_text(
+        datetime.fromisoformat(room["start"]), datetime.fromisoformat(room["end"]),
+        room["minutes"], room.get("code", ""),
+    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=GROUP_CHAT_ID, message_id=room["msg_id"], text=f"{base}\n\n{extra}",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logger.info("Could not edit the room post")
+
+
+def _persist_room(context, key: str, **changes):
+    sched = _get_today_schedule(context)
+    if not sched:
+        return None
+    room = sched.setdefault("rooms", {}).setdefault(key, {})
+    room.update(changes)
+    _save_schedule_state(sched)
+    return room
+
+
+async def _auto_host_create(context, key: str, start: datetime, end: datetime, minutes: int):
+    res = await agent_call("create_room", timeout=180, minutes=minutes)
+    code = str(res.get("code") or "")
+    if not res.get("ok") or not re.fullmatch(r"[A-Z0-9]{6,12}", code):
+        _persist_room(context, key, state="create_failed", error=str(res.get("error"))[:200])
+        await _notify_managers(context, f"⚠️ الاستضافة التلقائية: ما قدرت أفتح غرفة لفترة {start.strftime('%I:%M %p')}.\nالسبب: {res.get('error')}")
+        return
+    msg = await context.bot.send_message(
+        chat_id=GROUP_CHAT_ID,
+        text=_room_post_text(start, end, minutes, code),
+        disable_web_page_preview=True,
+        **_topic_kwargs(TOPIC_SESSIONS_ID),
+    )
+    _persist_room(context, key, state="open", code=code, msg_id=msg.message_id)
+
+
+async def _auto_host_start(context, key: str, attempt: int):
+    res = await agent_call("start_room", timeout=90)
+    sched = _get_today_schedule(context)
+    room = (sched or {}).get("rooms", {}).get(key)
+    if room is None:
+        return
+    if res.get("ok") and res.get("started"):
+        _persist_room(context, key, state="started", members=res.get("members"))
+        sched = _get_today_schedule(context)
+        sched.setdefault("link_sent", set()).add(key)  # lets the block auto-tick ✅ when it ends
+        _save_schedule_state(sched)
+        await _edit_room_post(context, room, "✅ بدأت الجلسة — بالتوفيق للكل!")
+        return
+    if attempt == 1:
+        retry_at = (local_now() + timedelta(seconds=AUTO_HOST_RETRY_SEC)).isoformat()
+        _persist_room(context, key, state="waiting_retry", next_try=retry_at, last_error=str(res.get("error") or ""))
+        return
+    final_state = "not_enough" if res.get("ok") else "failed"
+    _persist_room(context, key, state=final_state, last_error=str(res.get("error") or ""))
+    await _edit_room_post(context, room, "ما اكتمل العدد هالمرة، نلتقي بالفترة الجاية 🌿")
+    await agent_call("close_room", timeout=90)
+    if final_state == "failed":
+        await _notify_managers(context, f"⚠️ الاستضافة التلقائية: تعذّر بدء الغرفة.\nالسبب: {res.get('error')}")
+
+
+async def _auto_host_tick(context, sched: dict, now: datetime) -> set:
+    """One pass of the auto-host state machine for today's blocks. Returns
+    the block keys it is handling, so the old 'an admin shares a link'
+    ping is skipped for them."""
+    handled = set()
+    if not (auto_host_enabled() and HOST_AGENT_SECRET):
+        return handled
+    rooms = sched.setdefault("rooms", {})
+    for start, end in sched["blocks"]:
+        key = start.isoformat()
+        room = rooms.get(key)
+        if room is None:
+            if agent_connected() and start - timedelta(minutes=AUTO_HOST_LEAD_MIN) <= now < start - timedelta(minutes=1):
+                rooms[key] = {"state": "creating", "start": key, "end": end.isoformat(), "minutes": _block_minutes(start, end)}
+                _save_schedule_state(sched)
+                context.application.create_task(
+                    _auto_host_create(context, key, start, end, rooms[key]["minutes"])
+                )
+                handled.add(key)
+            continue
+        if room.get("state") in ("create_failed",):
+            continue  # fall back to the old manual-host ping
+        handled.add(key)
+        state = room.get("state")
+        # A redeploy mid-step loses the background task — don't stay stuck.
+        if state == "creating" and now >= start:
+            room["state"] = "create_failed"
+            _save_schedule_state(sched)
+            continue
+        if state == "starting" and now >= start + timedelta(minutes=4):
+            room["state"] = "failed"
+            _save_schedule_state(sched)
+            continue
+        if state == "open" and now >= start:
+            room["state"] = "starting"
+            _save_schedule_state(sched)
+            context.application.create_task(_auto_host_start(context, key, 1))
+        elif state == "waiting_retry" and now >= datetime.fromisoformat(room["next_try"]):
+            room["state"] = "starting"
+            _save_schedule_state(sched)
+            context.application.create_task(_auto_host_start(context, key, 2))
+    return handled
+
+
 async def job_check_schedule_pings(context: ContextTypes.DEFAULT_TYPE):
-    """Runs every 5 minutes; fires one short heads-up 5 minutes BEFORE
-    each scheduled block starts — not at the start itself. A ping at the
-    start is redundant when an admin already shared the link ahead of
-    time (the normal case); a heads-up beforehand is what's actually
-    useful, whether or not a link's already out."""
+    """Runs every minute. With the auto-host on (and the PC helper online),
+    a Forest room is opened 8 minutes before each block, its link posted,
+    and the session started exactly at the block time (one retry after a
+    minute if fewer than 2 people joined). Otherwise it falls back to the
+    old heads-up 5 minutes before each block asking an admin to host."""
     if not GROUP_CHAT_ID:
         return
     if get_setting("schedule_posting_enabled", "false") != "true":
@@ -3743,8 +3978,11 @@ async def job_check_schedule_pings(context: ContextTypes.DEFAULT_TYPE):
     if not sched:
         return
     now = local_now()
+    handled = await _auto_host_tick(context, sched, now)
     changed = False
     for start, end in sched["blocks"]:
+        if start.isoformat() in handled:
+            continue
         ping_time = start - timedelta(minutes=5)
         if ping_time <= now < start and start.isoformat() not in sched["pinged"]:
             sched["pinged"].add(start.isoformat())  # string, not datetime — keeps it JSON-serializable
@@ -3759,6 +3997,85 @@ async def job_check_schedule_pings(context: ContextTypes.DEFAULT_TYPE):
             )
     if changed:
         _save_schedule_state(sched)
+
+
+async def cmd_autohost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/autohost [on|off] — manager-only, private chat. Switches the Forest
+    auto-host on/off and shows whether the PC helper is online. Off by
+    default; also needs schedule posting on to post anything in the group."""
+    user = update.effective_user
+    if MANAGER_IDS and user.id not in MANAGER_IDS:
+        await update.message.reply_text("هذا الأمر مخصص للمنظّمين فقط.")
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("أرسل /autohost للبوت بالخاص.")
+        return
+    arg = (context.args[0].lower() if context.args else "")
+    if arg in ("on", "تشغيل"):
+        set_setting("auto_host_enabled", "true")
+    elif arg in ("off", "ايقاف", "إيقاف"):
+        set_setting("auto_host_enabled", "false")
+    online = "🟢 متصل" if agent_connected() else "🔴 غير متصل"
+    since = f" (من {AGENT['since'].strftime('%I:%M %p')})" if agent_connected() and AGENT.get("since") else ""
+    lines = [
+        "🤖 الاستضافة التلقائية لغرف Forest",
+        f"الحالة: {'✅ شغّالة' if auto_host_enabled() else '⏸️ موقوفة'}",
+        f"برنامج الكمبيوتر: {online}{since}",
+        f"نشر الجدول بالقروب: {'✅' if get_setting('schedule_posting_enabled', 'false') == 'true' else '⏸️ موقوف'}",
+    ]
+    if not HOST_AGENT_SECRET:
+        lines.append("⚠️ HOST_AGENT_SECRET غير مضبوط في Railway.")
+    lines.append("\nتشغيل: /autohost on — إيقاف: /autohost off — تجربة خاصة: /testroom")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _test_room_flow(context, chat_id: int, minutes: int, wait_sec: int):
+    res = await agent_call("create_room", timeout=180, minutes=minutes)
+    if not res.get("ok"):
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ ما قدرت أفتح غرفة.\nالسبب: {res.get('error')}")
+        return
+    code = res.get("code")
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"🧪 غرفة تجربة ({minutes} دقيقة) جاهزة:\n{forest_join_link(code)}\n🔑 \u200e{code}\n\n"
+            f"بضغط Start بعد {wait_sec // 60} دقايق. ادخل من جوالك قبلها."
+        ),
+        disable_web_page_preview=True,
+    )
+    await asyncio.sleep(wait_sec)
+    for attempt in (1, 2):
+        res = await agent_call("start_room", timeout=90)
+        if res.get("ok") and res.get("started"):
+            await context.bot.send_message(chat_id=chat_id, text=f"✅ بدأت الجلسة (attempt {attempt}).")
+            return
+        if attempt == 1:
+            await context.bot.send_message(chat_id=chat_id, text="⏳ ما اكتمل العدد، بحاول مرة ثانية بعد دقيقة.")
+            await asyncio.sleep(AUTO_HOST_RETRY_SEC)
+    await agent_call("close_room", timeout=90)
+    await context.bot.send_message(chat_id=chat_id, text=f"🌿 ما اكتمل العدد، سكّرت الغرفة. ({res.get('error') or 'fewer than 2'})")
+
+
+async def cmd_testroom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/testroom [minutes] — manager-only, private. Full private rehearsal:
+    opens a room (default 10 min), DMs the link, presses Start 3 minutes
+    later with the same 1-minute retry as the real thing. Nothing is posted
+    in the group."""
+    user = update.effective_user
+    if MANAGER_IDS and user.id not in MANAGER_IDS:
+        await update.message.reply_text("هذا الأمر مخصص للمنظّمين فقط.")
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("أرسل /testroom للبوت بالخاص.")
+        return
+    if not agent_connected():
+        await update.message.reply_text("🔴 برنامج الكمبيوتر غير متصل. شغّل host_agent.py على الكمبيوتر أول.")
+        return
+    minutes = 10
+    if context.args and context.args[0].isdigit():
+        minutes = max(10, min(int(context.args[0]) // 5 * 5, 180))
+    await update.message.reply_text(f"⏳ جاري فتح غرفة {minutes} دقيقة... (تاخذ دقيقة تقريبًا)")
+    context.application.create_task(_test_room_flow(context, update.effective_chat.id, minutes, 180))
 
 
 DAILY_POLL_QUESTION = "⏱️ كم ساعة ذاكرت اليوم؟"
@@ -4030,6 +4347,8 @@ def main():
     app.add_handler(CommandHandler("mycard", cmd_mycard))
     app.add_handler(CommandHandler("mylink", cmd_mylink))
     app.add_handler(CommandHandler("backupnow", cmd_backupnow))
+    app.add_handler(CommandHandler("autohost", cmd_autohost))
+    app.add_handler(CommandHandler("testroom", cmd_testroom))
     app.add_handler(CommandHandler("compare", cmd_compare))
     app.add_handler(CommandHandler("motivate", cmd_motivate))
     app.add_handler(CommandHandler("mytree", cmd_mytree))
