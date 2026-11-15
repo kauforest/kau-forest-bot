@@ -26,6 +26,7 @@ reading (see README.md) — without it, logging is unavailable, since
 screenshots are now the only way to log a session.
 """
 
+import asyncio
 import os
 import re
 import sqlite3
@@ -1402,14 +1403,20 @@ async def start_ws_server(app):
     logger.info(f"Live-update WebSocket server listening on 0.0.0.0:{port}")
 
 
+_LAST_GITHUB_ERROR = ""  # human-readable reason for the last failed push (shown by /backupnow)
+
+
 def _push_file_to_github(repo_path: str, content_bytes: bytes, commit_message: str, repo: str | None = None) -> bool:
     """Shared GitHub Contents API push (used by both the leaderboard sync
     and the DB backup below). Silently no-ops if the GitHub env vars
     aren't set, or if `requests` is missing — caller just gets False back.
     `repo` overrides which repo to push to (the DB backup uses this to
     target a private repo instead of the public GITHUB_REPO)."""
+    global _LAST_GITHUB_ERROR
+    _LAST_GITHUB_ERROR = ""
     target_repo = repo or GITHUB_REPO
     if not (REQUESTS_AVAILABLE and GITHUB_TOKEN and target_repo):
+        _LAST_GITHUB_ERROR = "GITHUB_TOKEN or the repo name is not set in Railway"
         return False
 
     content_b64 = base64.b64encode(content_bytes).decode("utf-8")
@@ -1433,12 +1440,24 @@ def _push_file_to_github(repo_path: str, content_bytes: bytes, commit_message: s
 
     try:
         put_resp = requests.put(api_url, headers=headers, json=payload, timeout=20)
+        if put_resp.status_code in (404, 409, 422) and not sha:
+            # Brand-new empty repo: the branch doesn't exist yet. Let GitHub
+            # create the first commit on its default branch instead.
+            payload.pop("branch", None)
+            put_resp = requests.put(api_url, headers=headers, json=payload, timeout=20)
         if put_resp.status_code not in (200, 201):
             logger.warning("GitHub push to %s failed (%s): %s", repo_path, put_resp.status_code, put_resp.text)
+            hint = {
+                401: "token is wrong or expired",
+                403: "token doesn't have write access (Contents: Read and write) to this repo",
+                404: "repo not found, or the token can't see it",
+            }.get(put_resp.status_code, put_resp.text[:150])
+            _LAST_GITHUB_ERROR = f"GitHub said {put_resp.status_code}: {hint}"
             return False
         return True
-    except Exception:
+    except Exception as e:
         logger.exception(f"Failed to push {repo_path} to GitHub")
+        _LAST_GITHUB_ERROR = f"network error: {e}"
         return False
 
 
@@ -1464,12 +1483,16 @@ def backup_database_to_github():
     would make it publicly downloadable. Off entirely until a private
     repo is explicitly configured, rather than silently falling back to
     the public one."""
+    global _LAST_GITHUB_ERROR
     if not BACKUP_GITHUB_REPO:
-        return
+        _LAST_GITHUB_ERROR = "BACKUP_GITHUB_REPO is not set in Railway"
+        return False
     if not os.path.exists(DB_PATH):
-        return
-    with open(DB_PATH, "rb") as f:
-        db_bytes = f.read()
+        _LAST_GITHUB_ERROR = f"database file not found at {DB_PATH}"
+        return False
+    if not _repo_is_private(BACKUP_GITHUB_REPO):
+        return False  # reason already set — never upload member data to a public repo
+    db_bytes = _snapshot_database_bytes()
     ok = _push_file_to_github(
         "backups/forest-latest.db",
         db_bytes,
@@ -1478,10 +1501,87 @@ def backup_database_to_github():
     )
     if ok:
         logger.info("Database backup pushed to GitHub")
+    return ok
+
+
+def _repo_is_private(repo: str) -> bool:
+    """Asks GitHub whether the backup repo is really private before every
+    upload. If it can't confirm, it refuses — the October leak happened
+    because a backup went to a public repo."""
+    global _LAST_GITHUB_ERROR
+    if repo.strip().lower() == (GITHUB_REPO or "").strip().lower():
+        _LAST_GITHUB_ERROR = "BACKUP_GITHUB_REPO is the same as the PUBLIC website repo — refused"
+        return False
+    if not (REQUESTS_AVAILABLE and GITHUB_TOKEN):
+        _LAST_GITHUB_ERROR = "GITHUB_TOKEN is not set in Railway"
+        return False
+    try:
+        resp = requests.get(
+            f"https://api.github.com/repos/{repo}",
+            headers={"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
+            timeout=10,
+        )
+    except Exception as e:
+        _LAST_GITHUB_ERROR = f"couldn't check the repo: {e}"
+        return False
+    if resp.status_code != 200:
+        _LAST_GITHUB_ERROR = {
+            401: "GitHub said 401: token is wrong or expired",
+            404: f"GitHub said 404: repo {repo} not found, or the token can't see it",
+        }.get(resp.status_code, f"GitHub said {resp.status_code} when checking the repo")
+        return False
+    if resp.json().get("private") is not True:
+        _LAST_GITHUB_ERROR = f"{repo} is PUBLIC — refused to upload member data there. Make it private first."
+        return False
+    return True
+
+
+def _snapshot_database_bytes() -> bytes:
+    """A consistent copy of the live DB via SQLite's own backup API, instead
+    of reading the file bytes while the bot might be mid-write (which can
+    produce a half-written, unusable backup)."""
+    import tempfile
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(tmp_path)
+        with dst:
+            src.backup(dst)
+        dst.close()
+        src.close()
+        with open(tmp_path, "rb") as f:
+            return f.read()
+    finally:
+        os.remove(tmp_path)
+
+
+async def cmd_backupnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/backupnow — manager-only, private chat. Runs the daily backup right
+    away and says whether it worked (and why not), so the private-repo
+    setup can be checked without waiting for 04:00."""
+    user = update.effective_user
+    if MANAGER_IDS and user.id not in MANAGER_IDS:
+        await update.message.reply_text("هذا الأمر مخصص للمنظّمين فقط.")
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("أرسل /backupnow للبوت بالخاص.")
+        return
+    await update.message.reply_text("⏳ جاري أخذ نسخة احتياطية...")
+    ok = await asyncio.to_thread(backup_database_to_github)
+    if ok:
+        await update.message.reply_text(
+            f"✅ تمت النسخة الاحتياطية بنجاح إلى {BACKUP_GITHUB_REPO}\n"
+            "والنسخة التلقائية تشتغل كل يوم الساعة ٤ الفجر."
+        )
+    else:
+        await update.message.reply_text(f"❌ ما نجحت النسخة الاحتياطية.\nالسبب: {_LAST_GITHUB_ERROR or 'unknown'}")
 
 
 async def job_backup_database(context: ContextTypes.DEFAULT_TYPE):
-    backup_database_to_github()
+    # In a thread so the slow GitHub upload doesn't freeze the bot.
+    await asyncio.to_thread(backup_database_to_github)
 
 
 def daily_total_all() -> int:
@@ -3929,6 +4029,7 @@ def main():
     app.add_handler(CommandHandler("me", cmd_me))
     app.add_handler(CommandHandler("mycard", cmd_mycard))
     app.add_handler(CommandHandler("mylink", cmd_mylink))
+    app.add_handler(CommandHandler("backupnow", cmd_backupnow))
     app.add_handler(CommandHandler("compare", cmd_compare))
     app.add_handler(CommandHandler("motivate", cmd_motivate))
     app.add_handler(CommandHandler("mytree", cmd_mytree))
