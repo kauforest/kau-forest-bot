@@ -19,3 +19,10 @@ __pycache__/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# auto-host helper local files
+forest_host/secret.txt
+forest_host/agent_state.json
+forest_host/agent.log
+forest_host/lab/
+forest_host/captures/
