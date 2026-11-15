@@ -1,0 +1,8 @@
+.git
+backups/
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+__pycache__/

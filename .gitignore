@@ -1,0 +1,21 @@
+# Real user data must NEVER be committed to this public repo.
+# Backups go to the separate PRIVATE repo set in BACKUP_GITHUB_REPO.
+backups/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Secrets
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+Thumbs.db
