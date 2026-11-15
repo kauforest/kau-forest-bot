@@ -32,6 +32,7 @@ import sqlite3
 import base64
 import json
 import logging
+import secrets
 from datetime import datetime, date, timedelta, time as dtime
 from io import BytesIO
 
@@ -137,6 +138,8 @@ VALID_BATCHES = ["Med22", "Med23", "Med24", "Med25", "Med26", "Med27"]
 # GitHub Pages site can display the leaderboard publicly. Leave any of
 # these unset to disable website syncing entirely (the bot still works).
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+# Public website address — used to build each member's private «تحليلاتي» link.
+SITE_URL = os.environ.get("SITE_URL", "https://kauforest.github.io/kau-forest-bot/")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. "yourname/study-leaderboard" — this is PUBLIC, used for the website
 BACKUP_GITHUB_REPO = os.environ.get("BACKUP_GITHUB_REPO", "")  # MUST be a separate PRIVATE repo — real user data goes here
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
@@ -384,6 +387,15 @@ def init_db():
             time_window TEXT NOT NULL,
             logged_date TEXT NOT NULL,
             PRIMARY KEY (user_id, time_window, logged_date)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analytics_tokens (
+            user_id INTEGER PRIMARY KEY,
+            token TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
         )
         """
     )
@@ -825,6 +837,59 @@ def most_improved(this_week_start: date, last_week_start: date):
 # ---------------------------------------------------------------------------
 # Personal analytics (website "تحليلاتي" page + weekly recap DM insight)
 # ---------------------------------------------------------------------------
+
+
+# --- Private «تحليلاتي» links -------------------------------------------
+# Each member gets a secret token (from /mylink, in a private chat). The
+# website only shows analytics to someone holding that token — typing a
+# username no longer works, so nobody can look up someone else's pattern.
+# The token sits in the URL #fragment, which browsers never send to GitHub
+# Pages, and is stored in the settings-style table so it survives restarts.
+
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+
+
+def get_or_create_analytics_token(user_id: int) -> str:
+    conn = db()
+    row = conn.execute("SELECT token FROM analytics_tokens WHERE user_id=?", (user_id,)).fetchone()
+    if row:
+        conn.close()
+        return row["token"]
+    token = secrets.token_urlsafe(16)
+    conn.execute(
+        "INSERT INTO analytics_tokens (user_id, token, created_at) VALUES (?, ?, ?)",
+        (user_id, token, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return token
+
+
+def regenerate_analytics_token(user_id: int) -> str:
+    """Kills the old link (e.g. if someone shared it by mistake)."""
+    token = secrets.token_urlsafe(16)
+    conn = db()
+    conn.execute(
+        "INSERT INTO analytics_tokens (user_id, token, created_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET token=excluded.token, created_at=excluded.created_at",
+        (user_id, token, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return token
+
+
+def user_id_for_analytics_token(token: str) -> int | None:
+    if not isinstance(token, str) or not _TOKEN_RE.match(token):
+        return None
+    conn = db()
+    row = conn.execute("SELECT user_id FROM analytics_tokens WHERE token=?", (token,)).fetchone()
+    conn.close()
+    return row["user_id"] if row else None
+
+
+def analytics_link_for(user_id: int) -> str:
+    return f"{SITE_URL}#me={get_or_create_analytics_token(user_id)}"
 
 
 def find_user_by_telegram_handle(handle: str) -> int | None:
@@ -1279,7 +1344,8 @@ async def broadcast_update():
 
 async def _handle_ws_request(websocket, raw_message):
     """The one inbound message type the site actually sends: a 'تحليلاتي'
-    (My Analytics) lookup from docs/index.html. Answered directly to the
+    (My Analytics) lookup from docs/index.html, keyed by the member's
+    private /mylink token. Answered directly to the
     requesting socket ONLY — never via broadcast_update() / CONNECTED_CLIENTS
     — since the response can carry another member's personal daily/time-of-day
     pattern that nobody else asked for and that must never end up folded into
@@ -1291,10 +1357,13 @@ async def _handle_ws_request(websocket, raw_message):
         return
     if not isinstance(request, dict) or request.get("type") != "personal_analytics":
         return
-    username = str(request.get("username") or "")[:64]
-    user_id = find_user_by_telegram_handle(username)
-    if user_id is None:
-        response = {"type": "personal_analytics", "found": False}
+    # Only a private /mylink token opens someone's analytics. Old-style
+    # username lookups are refused on purpose (privacy), with a reason the
+    # site can turn into "send /mylink to the bot".
+    user_id = user_id_for_analytics_token(request.get("token"))
+    if user_id is None or not get_user(user_id):
+        reason = "use_link" if request.get("username") and not request.get("token") else "invalid"
+        response = {"type": "personal_analytics", "found": False, "reason": reason}
     else:
         response = {"type": "personal_analytics", "found": True, "data": build_personal_analytics(user_id)}
     try:
@@ -2074,6 +2143,32 @@ def generate_stat_card_image(user_id: int):
     img.save(buf, format="PNG")
     buf.seek(0)
     return buf
+
+
+async def cmd_mylink(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mylink — sends the member their PRIVATE «تحليلاتي» link. Only works
+    in a private chat, so a link is never posted where others can tap it.
+    `/mylink جديد` (or `new`) replaces the link if it was shared by mistake."""
+    user = update.effective_user
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("🔒 رابط تحليلاتك خاص — أرسل /mylink للبوت بالخاص.")
+        return
+    if not get_user(user.id):
+        await update.message.reply_text("سجّل نفسك أولًا: /register Med25")
+        return
+    renew = bool(context.args) and context.args[0].strip().lower() in ("جديد", "new")
+    if renew:
+        regenerate_analytics_token(user.id)
+    link = analytics_link_for(user.id)
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📊 افتح تحليلاتي", url=link)]])
+    text = (
+        ("🔄 سوّيت لك رابط جديد، والقديم ما عاد يشتغل.\n\n" if renew else "")
+        + "📊 هذا رابط تحليلاتك الخاص — افتحه من الزر تحت.\n"
+        "الموقع بيتذكرك على نفس الجهاز بعدها.\n\n"
+        "🔒 لا تشاركه: اللي معه الرابط يشوف تحليلاتك.\n"
+        "لو شاركته بالغلط أرسل: /mylink جديد"
+    )
+    await update.message.reply_text(text, reply_markup=keyboard)
 
 
 async def cmd_mycard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3577,7 +3672,7 @@ async def job_daily_poll(context: ContextTypes.DEFAULT_TYPE):
         chat_id=GROUP_CHAT_ID,
         question=DAILY_POLL_QUESTION,
         options=DAILY_POLL_OPTIONS,
-        is_anonymous=False,
+        is_anonymous=True,  # nobody sees who voted what
         **_topic_kwargs(TOPIC_CHAT_ID),
     )
 
@@ -3596,7 +3691,7 @@ async def cmd_testpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=user.id,
         question=DAILY_POLL_QUESTION,
         options=DAILY_POLL_OPTIONS,
-        is_anonymous=False,
+        is_anonymous=True,  # nobody sees who voted what
     )
 
 
@@ -3641,6 +3736,11 @@ async def job_weekly_personal_recap(context: ContextTypes.DEFAULT_TYPE):
                     f"{insight_line}"
                 ),
                 parse_mode="Markdown",
+                # A URL button rather than a link in the text: the token can
+                # contain _ or -, which Markdown would mangle.
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("📊 تحليلاتي الكاملة", url=analytics_link_for(u["user_id"]))]]
+                ),
             )
         except Exception:
             # Most common cause: the user blocked the bot or never started
@@ -3828,6 +3928,7 @@ def main():
     app.add_handler(CommandHandler("findpartner", cmd_findpartner))
     app.add_handler(CommandHandler("me", cmd_me))
     app.add_handler(CommandHandler("mycard", cmd_mycard))
+    app.add_handler(CommandHandler("mylink", cmd_mylink))
     app.add_handler(CommandHandler("compare", cmd_compare))
     app.add_handler(CommandHandler("motivate", cmd_motivate))
     app.add_handler(CommandHandler("mytree", cmd_mytree))
