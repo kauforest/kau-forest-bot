@@ -312,6 +312,27 @@ async def auto_host_tests():
     check("auto-host: post edited to 'started'", any("بدأت الجلسة" in e[1] for e in c.bot.edits))
     check("auto-host: block will auto-tick ✅", st.isoformat() in fb._load_schedule_state()["link_sent"])
 
+    # --- scenario A2: prepared at 10 min, link posted exactly at 8 min
+    c = make_ctx(); base, st = plan_day(c, 10)
+    agP = FakeAgent([])
+    await fb._handle_agent_message(agP, {"type": "agent_hello", "secret": "s3cret-value-xyz"})
+    fb.local_now = lambda: base
+    await fb.job_check_schedule_pings(c); await settle(c)
+    room = fb._load_schedule_state()["rooms"][st.isoformat()]
+    check("auto-host: room PREPARED 10 min before, not posted yet", agP.cmds == ["create_room"] and room["state"] == "ready"
+          and not c.bot.msgs, room["state"])
+    fb.local_now = lambda: st - timedelta(minutes=9)
+    await fb.job_check_schedule_pings(c); await settle(c)
+    check("auto-host: still not posted at 9 min", not c.bot.msgs and agP.cmds.count("create_room") == 1)
+    fb.local_now = lambda: st - timedelta(minutes=8)
+    await fb.job_check_schedule_pings(c); await settle(c)
+    room = fb._load_schedule_state()["rooms"][st.isoformat()]
+    check("auto-host: link posted exactly at 8 min", len(c.bot.msgs) == 1 and room["state"] == "open"
+          and "ABCD123G" in c.bot.msgs[0][1], room["state"])
+    fb.local_now = lambda: st - timedelta(minutes=7)
+    await fb.job_check_schedule_pings(c); await settle(c)
+    check("auto-host: posted only once", len(c.bot.msgs) == 1)
+
     # --- scenario B: nobody joins -> calm message + room closed
     c = make_ctx(); base, st = plan_day(c, 6)
     agB = FakeAgent([{"ok": True, "started": False, "members": 0}, {"ok": True, "started": False, "members": 0}])
