@@ -147,6 +147,7 @@ SITE_URL = os.environ.get("SITE_URL", "https://kauforest.github.io/kau-forest-bo
 HOST_AGENT_SECRET = os.environ.get("HOST_AGENT_SECRET", "")
 AUTO_HOST_PREP_MIN = 10  # the PC starts preparing the room this many minutes before a block…
 AUTO_HOST_LEAD_MIN = 8   # …and the link is posted exactly this many minutes before (Husain's choice)
+AUTO_HOST_CREATE_GIVEUP_MIN = 3  # keep retrying room creation until this many minutes before the block
 AUTO_HOST_RETRY_SEC = 60  # if <2 people at start time, try once more after 1 minute, then give up
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. "yourname/study-leaderboard" — this is PUBLIC, used for the website
 BACKUP_GITHUB_REPO = os.environ.get("BACKUP_GITHUB_REPO", "")  # MUST be a separate PRIVATE repo — real user data goes here
@@ -3884,6 +3885,14 @@ async def _auto_host_create(context, key: str, start: datetime, end: datetime, m
     res = await agent_call("create_room", timeout=180, minutes=minutes)
     code = str(res.get("code") or "")
     if not res.get("ok") or not re.fullmatch(r"[A-Z0-9]{6,12}", code):
+        # Back-to-back blocks: the room for the next block is prepared 10 min
+        # before it, which is the same minute the previous session ends — the
+        # PC is still finishing that one ("a session is still running"). Keep
+        # trying every minute while there's time, before giving up.
+        if local_now() < start - timedelta(minutes=AUTO_HOST_CREATE_GIVEUP_MIN):
+            _persist_room(context, key, state="create_retry", error=str(res.get("error"))[:200],
+                          next_try=(local_now() + timedelta(seconds=30)).isoformat())
+            return
         _persist_room(context, key, state="create_failed", error=str(res.get("error"))[:200])
         await _notify_managers(context, f"⚠️ الاستضافة التلقائية: ما قدرت أفتح غرفة لفترة {start.strftime('%I:%M %p')}.\nالسبب: {res.get('error')}")
         return
@@ -3961,6 +3970,17 @@ async def _auto_host_tick(context, sched: dict, now: datetime) -> set:
             continue
         if room.get("state") in ("create_failed",):
             continue  # fall back to the old manual-host ping
+        if room.get("state") == "create_retry":
+            handled.add(key)
+            if now >= start - timedelta(minutes=AUTO_HOST_CREATE_GIVEUP_MIN):
+                room["state"] = "create_failed"  # out of time → old ping as backup
+                _save_schedule_state(sched)
+                handled.discard(key)
+            elif agent_connected() and now >= datetime.fromisoformat(room["next_try"]):
+                room["state"] = "creating"
+                _save_schedule_state(sched)
+                context.application.create_task(_auto_host_create(context, key, start, end, room["minutes"]))
+            continue
         handled.add(key)
         state = room.get("state")
         # A redeploy mid-step loses the background task — don't stay stuck.

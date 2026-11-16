@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 BOT_WS_URL = os.environ.get("FOREST_BOT_WS", "wss://kau-forest-bot-production.up.railway.app")
-VERSION = 1
+VERSION = 2
 
 ADB_CANDIDATES = [
     (r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe", "127.0.0.1:5555"),
@@ -438,10 +438,25 @@ ACTIONS = {
 }
 
 
+def _wait_for_session_end(max_wait=150):
+    """Back-to-back blocks: the next room is requested the same minute the
+    previous session ends. If it ends within ~2.5 min, wait for it (and for
+    Continue -> All Done) instead of refusing."""
+    until = load_state().get("session_until")
+    if not until:
+        return
+    left = (datetime.fromisoformat(until) - datetime.now()).total_seconds()
+    if 0 < left <= max_wait:
+        log.info("previous session ends in %ds — waiting for it before preparing the next room", int(left))
+        time.sleep(left + 2)
+
+
 def run_action(action: str, params: dict) -> dict:
     fn = ACTIONS.get(action)
     if not fn:
         return {"ok": False, "error": f"unknown action {action}"}
+    if action == "create_room":
+        _wait_for_session_end()  # the finisher then holds LOCK until Forest is back home
     with LOCK:
         try:
             adb_connect()

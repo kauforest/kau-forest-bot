@@ -335,6 +335,45 @@ async def auto_host_tests():
     await fb.job_check_schedule_pings(c); await settle(c)
     check("auto-host: posted only once", len(c.bot.msgs) == 1)
 
+    # --- scenario A3: previous session still running at prep time -> retry next minute (live bug 2026-11-16 10:30)
+    class BusyThenOK(FakeAgent):
+        def __init__(self): super().__init__([]); self.busy = 1
+        async def send(self, raw):
+            m = json.loads(raw)
+            if m.get("type") == "cmd" and m["action"] == "create_room" and self.busy:
+                self.busy -= 1; self.cmds.append("create_room")
+                _aio.get_running_loop().call_soon(lambda: _aio.ensure_future(fb._handle_agent_message(
+                    self, {"type": "cmd_result", "id": m["id"], "ok": False, "error": "a session is still running"})))
+                return
+            await super().send(raw)
+    c = make_ctx(); base, st = plan_day(c, 10)
+    agBusy = BusyThenOK()
+    await fb._handle_agent_message(agBusy, {"type": "agent_hello", "secret": "s3cret-value-xyz"})
+    fb.local_now = lambda: base
+    await fb.job_check_schedule_pings(c); await settle(c)
+    room = fb._load_schedule_state()["rooms"][st.isoformat()]
+    check("auto-host: PC busy at prep time -> will retry (no alarm, no old ping)", room["state"] == "create_retry"
+          and not c.bot.msgs, room["state"])
+    fb.local_now = lambda: base + timedelta(minutes=1)
+    await fb.job_check_schedule_pings(c); await settle(c)
+    fb.local_now = lambda: st - timedelta(minutes=8)
+    await fb.job_check_schedule_pings(c); await settle(c)
+    room = fb._load_schedule_state()["rooms"][st.isoformat()]
+    check("auto-host: retry a minute later succeeds, link still posted at 8 min", agBusy.cmds.count("create_room") == 2
+          and room["state"] == "open" and len(c.bot.msgs) == 1 and "ABCD123G" in c.bot.msgs[0][1], room["state"])
+    # busy all the way -> gives up 3 min before and the old ping covers it
+    class AlwaysBusy(BusyThenOK):
+        def __init__(self): super().__init__(); self.busy = 99
+    c = make_ctx(); base, st = plan_day(c, 10)
+    agAB = AlwaysBusy()
+    await fb._handle_agent_message(agAB, {"type": "agent_hello", "secret": "s3cret-value-xyz"})
+    for m_before in (10, 9, 8, 7, 6, 5, 4, 3):
+        fb.local_now = lambda m_before=m_before: st - timedelta(minutes=m_before)
+        await fb.job_check_schedule_pings(c); await settle(c)
+    room = fb._load_schedule_state()["rooms"][st.isoformat()]
+    check("auto-host: still busy at 3 min -> gives up, old ping as backup", room["state"] == "create_failed"
+          and any("أحد الأدمنز" in m[1] for m in c.bot.msgs), room["state"])
+
     # --- scenario B: nobody joins -> calm message + room closed
     c = make_ctx(); base, st = plan_day(c, 6)
     agB = FakeAgent([{"ok": True, "started": False, "members": 0}, {"ok": True, "started": False, "members": 0}])
