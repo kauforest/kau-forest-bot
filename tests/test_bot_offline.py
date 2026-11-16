@@ -311,7 +311,8 @@ async def auto_host_tests():
     await fb.job_check_schedule_pings(c); await settle(c)
     room = fb._load_schedule_state()["rooms"][st.isoformat()]
     check("auto-host: second try starts the session", room["state"] == "started" and agA.cmds.count("start_room") == 2, room["state"])
-    check("auto-host: post edited to 'started'", any("بدأت الجلسة" in e[1] for e in c.bot.edits))
+    check("auto-host: post edited to 'started' WITH the start time", any("بدأت الجلسة الساعة" in e[1] and (st + timedelta(seconds=62)).strftime('%I:%M %p') in e[1] for e in c.bot.edits),
+          [e[1].splitlines()[-1] for e in c.bot.edits][-1:])
     check("auto-host: block will auto-tick ✅", st.isoformat() in fb._load_schedule_state()["link_sent"])
 
     # --- scenario A2: prepared at 10 min, link posted exactly at 8 min

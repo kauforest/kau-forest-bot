@@ -3922,7 +3922,9 @@ async def _auto_host_start(context, key: str, attempt: int):
         sched = _get_today_schedule(context)
         sched.setdefault("link_sent", set()).add(key)  # lets the block auto-tick ✅ when it ends
         _save_schedule_state(sched)
-        await _edit_room_post(context, room, "✅ بدأت الجلسة — بالتوفيق للكل!")
+        # Telegram doesn't mark a bot's edits as "edited" and keeps the post's
+        # original time, so say WHEN it started inside the text itself.
+        await _edit_room_post(context, room, f"✅ بدأت الجلسة الساعة {local_now().strftime('%I:%M %p')} — بالتوفيق للكل!")
         return
     if attempt == 1:
         # Count the minute from the block's start time, not from when the
@@ -3933,7 +3935,7 @@ async def _auto_host_start(context, key: str, attempt: int):
         return
     final_state = "not_enough" if res.get("ok") else "failed"
     _persist_room(context, key, state=final_state, last_error=str(res.get("error") or ""))
-    await _edit_room_post(context, room, "ما اكتمل العدد هالمرة، نلتقي بالفترة الجاية 🌿")
+    await _edit_room_post(context, room, f"⏹️ {local_now().strftime('%I:%M %p')} — ما اكتمل العدد هالمرة، نلتقي بالفترة الجاية 🌿")
     await agent_call("close_room", timeout=90)
     if final_state == "failed":
         await _notify_managers(context, f"⚠️ الاستضافة التلقائية: تعذّر بدء الغرفة.\nالسبب: {res.get('error')}")
