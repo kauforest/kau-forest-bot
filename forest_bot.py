@@ -3925,7 +3925,10 @@ async def _auto_host_start(context, key: str, attempt: int):
         await _edit_room_post(context, room, "✅ بدأت الجلسة — بالتوفيق للكل!")
         return
     if attempt == 1:
-        retry_at = (local_now() + timedelta(seconds=AUTO_HOST_RETRY_SEC)).isoformat()
+        # Count the minute from the block's start time, not from when the
+        # first attempt finished (~25 s later) — otherwise, with the job
+        # ticking once a minute, the retry slipped to ~2 minutes.
+        retry_at = (datetime.fromisoformat(room["start"]) + timedelta(seconds=AUTO_HOST_RETRY_SEC)).isoformat()
         _persist_room(context, key, state="waiting_retry", next_try=retry_at, last_error=str(res.get("error") or ""))
         return
     final_state = "not_enough" if res.get("ok") else "failed"

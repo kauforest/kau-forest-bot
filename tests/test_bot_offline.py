@@ -305,7 +305,9 @@ async def auto_host_tests():
     fb.local_now = lambda: st + timedelta(seconds=30)
     await fb.job_check_schedule_pings(c); await settle(c)
     check("auto-host: no retry before the minute is up", agA.cmds.count("start_room") == 1)
-    fb.local_now = lambda: st + timedelta(seconds=65)
+    check("auto-host: retry is due exactly 1 min after the block start",
+          fb._load_schedule_state()["rooms"][st.isoformat()]["next_try"] == (st + timedelta(seconds=60)).isoformat())
+    fb.local_now = lambda: st + timedelta(seconds=62)  # the next once-a-minute tick
     await fb.job_check_schedule_pings(c); await settle(c)
     room = fb._load_schedule_state()["rooms"][st.isoformat()]
     check("auto-host: second try starts the session", room["state"] == "started" and agA.cmds.count("start_room") == 2, room["state"])
