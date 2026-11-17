@@ -313,6 +313,10 @@ async def auto_host_tests():
     check("auto-host: second try starts the session", room["state"] == "started" and agA.cmds.count("start_room") == 2, room["state"])
     check("auto-host: post edited to 'started'", any("بدأت الجلسة" in e[1] for e in c.bot.edits))
     check("auto-host: block will auto-tick ✅", st.isoformat() in fb._load_schedule_state()["link_sent"])
+    hs = json.loads(fb.get_setting("autohost_stats") or "{}")
+    check("auto-host: all-time counters kept for /impact",
+          hs.get("rooms_posted") == 1 and hs.get("sessions_started") == 1 and hs.get("participants") == 2
+          and hs.get("participant_minutes") == 120, str(hs))
 
     # --- scenario A2: prepared at 10 min, link posted exactly at 8 min
     c = make_ctx(); base, st = plan_day(c, 10)
@@ -422,6 +426,28 @@ async def auto_host_tests():
 
 _aio.run(auto_host_tests())
 
+# ---- 9e. /impact (community totals for reports / CV) ---------------------
+st_ = fb.impact_stats()
+conn_ = fb.db()
+raw_ = conn_.execute(fb._EFFECTIVE_CTE + "SELECT COALESCE(SUM(minutes),0) AS m FROM daily_effective", {"since": "2000-01-01"}).fetchone()["m"]
+regs_ = conn_.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+conn_.close()
+check("/impact: total hours = sum of every member's effective minutes", st_["total_minutes"] == raw_, f"{raw_} min")
+check("/impact: registered count matches users table", st_["registered"] == regs_, str(regs_))
+check("/impact: longest streak >= lina's 10-day streak", st_["longest_streak"] >= 10, str(st_["longest_streak"]))
+check("/impact: best day/week/month found", st_["best_day"] and st_["best_week"] and st_["best_month"])
+check("/impact: levels cover every member who logged", sum(st_["levels"].values()) == st_["loggers"], str(st_["levels"]))
+check("/impact: helper logic for runs", fb._longest_run([date(2026, 1, 1), date(2026, 1, 2), date(2026, 1, 4), date(2026, 1, 5), date(2026, 1, 6)]) == 3)
+u, m = upd("private", uid=1001); asyncio.run(fb.cmd_impact(u, ctx()))
+check("/impact is managers-only", "للمنظّمين" in m.replies[0][0])
+u, m = upd("supergroup", uid=1); asyncio.run(fb.cmd_impact(u, ctx()))
+check("/impact refuses in the group", "بالخاص" in m.replies[0][0])
+u, m = upd("private", uid=1); asyncio.run(fb.cmd_impact(u, ctx()))
+txt_ = m.replies[-1][0]
+check("/impact reply has totals + CV line", "أثر غابة الطب" in txt_ and "CV line" in txt_ and "study hours" in txt_, txt_.splitlines()[2] if len(txt_.splitlines()) > 2 else txt_)
+check("/impact shows no member names", not any(n in txt_ for n in ("@sara", "@omar", "@lina")))
+print("----- /impact sample -----\n" + txt_ + "\n--------------------------")
+
 # ---- 10. things that were already on main still work -------------------
 check("display_streak still present", fb.display_streak(1003) >= 10, str(fb.display_streak(1003)))
 check("time-window dedup still present", fb.extract_time_window("14:08 - 15:08") == "14:08-15:08")
@@ -435,7 +461,7 @@ Application.run_polling = fake_run_polling
 fb.main()
 app = captured["app"]
 cmds = {c for h in app.handlers[0] if hasattr(h, "commands") for c in h.commands}
-for c_ in ["mycard", "mylink", "backupnow", "autohost", "testroom", "findpartner", "me", "stats", "testschedule", "pausescheduleposts"]:
+for c_ in ["mycard", "mylink", "backupnow", "impact", "autohost", "testroom", "findpartner", "me", "stats", "testschedule", "pausescheduleposts"]:
     check(f"/{c_} registered", c_ in cmds)
 jobs = {j.callback.__name__: j for j in app.job_queue.jobs()}
 for j in ["job_monthly_titles", "job_streak_save_nudge", "job_weekly_personal_recap", "job_auto_complete_sessions"]:
