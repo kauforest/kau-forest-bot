@@ -1653,6 +1653,153 @@ def _snapshot_database_bytes() -> bytes:
         os.remove(tmp_path)
 
 
+def _longest_run(days: list[date]) -> int:
+    best = run = 0
+    prev = None
+    for d in sorted(set(days)):
+        run = run + 1 if prev and (d - prev).days == 1 else 1
+        best = max(best, run)
+        prev = d
+    return best
+
+
+def impact_stats() -> dict:
+    """Whole-community numbers for /impact (Husain's CV / reports).
+    Aggregates only — no names leave this function."""
+    today = local_today()
+    conn = db()
+    p = {"since": "2000-01-01"}
+    users = conn.execute("SELECT batch, COUNT(*) AS n FROM users GROUP BY batch ORDER BY batch").fetchall()
+    per_user = conn.execute(
+        _EFFECTIVE_CTE + "SELECT user_id, SUM(minutes) AS m, COUNT(*) AS days FROM daily_effective GROUP BY user_id", p
+    ).fetchall()
+    per_day = conn.execute(
+        _EFFECTIVE_CTE + "SELECT session_date, SUM(minutes) AS m FROM daily_effective GROUP BY session_date", p
+    ).fetchall()
+    user_days = conn.execute(
+        _EFFECTIVE_CTE + "SELECT user_id, session_date FROM daily_effective WHERE minutes > 0", p
+    ).fetchall()
+    entries = conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"]
+    shots = conn.execute("SELECT COUNT(*) AS n FROM screenshots").fetchone()["n"]
+
+    def active_since(days):
+        return conn.execute(
+            "SELECT COUNT(DISTINCT user_id) AS n FROM sessions WHERE session_date >= ?",
+            ((today - timedelta(days=days - 1)).isoformat(),),
+        ).fetchone()["n"]
+
+    active7, active30 = active_since(7), active_since(30)
+    weeks_of_fame = conn.execute("SELECT COUNT(*) AS n FROM hall_of_fame").fetchone()["n"]
+    conn.close()
+
+    total_min = sum(r["m"] or 0 for r in per_user)
+    weeks: dict[date, int] = {}
+    months: dict[str, int] = {}
+    best_day = None
+    for r in per_day:
+        d = date.fromisoformat(r["session_date"])
+        m = r["m"] or 0
+        weeks[week_start_for(d)] = weeks.get(week_start_for(d), 0) + m
+        months[r["session_date"][:7]] = months.get(r["session_date"][:7], 0) + m
+        if best_day is None or m > best_day[1]:
+            best_day = (d, m)
+    best_week = max(weeks.items(), key=lambda kv: kv[1]) if weeks else None
+    best_month = max(months.items(), key=lambda kv: kv[1]) if months else None
+
+    by_user: dict[int, list[date]] = {}
+    for r in user_days:
+        by_user.setdefault(r["user_id"], []).append(date.fromisoformat(r["session_date"]))
+    longest_streak = max((_longest_run(ds) for ds in by_user.values()), default=0)
+
+    levels: dict[str, int] = {}
+    for r in per_user:
+        title = level_title_for(level_for_total(r["m"] or 0))
+        levels[title] = levels.get(title, 0) + 1
+
+    try:
+        host = json.loads(get_setting("autohost_stats") or "{}")
+    except ValueError:
+        host = {}
+    first_day = min((date.fromisoformat(r["session_date"]) for r in per_day), default=None)
+    return {
+        "registered": sum(r["n"] for r in users),
+        "per_batch": [(r["batch"], r["n"]) for r in users],
+        "loggers": sum(1 for r in per_user if (r["m"] or 0) > 0),
+        "total_minutes": total_min,
+        "entries": entries,
+        "screenshots": shots,
+        "active7": active7,
+        "active30": active30,
+        "best_day": best_day,
+        "best_week": best_week,
+        "best_month": best_month,
+        "longest_streak": longest_streak,
+        "levels": levels,
+        "weeks_of_fame": weeks_of_fame,
+        "first_day": first_day,
+        "launch": LAUNCH_DATE or (first_day.isoformat() if first_day else ""),
+        "host": host,
+    }
+
+
+def _hrs(minutes: int) -> str:
+    return f"{minutes / 60:,.0f}" if minutes >= 600 else f"{minutes / 60:,.1f}"
+
+
+def impact_text(st: dict) -> str:
+    lines = ["📈 <b>أثر غابة الطب</b>", ""]
+    lines.append(f"👥 المسجلين: <b>{st['registered']}</b>  (سجّلوا مذاكرة: {st['loggers']})")
+    if st["per_batch"]:
+        lines.append("   " + " · ".join(f"{b}: {n}" for b, n in st["per_batch"]))
+    lines.append(f"⏱️ مجموع ساعات المذاكرة: <b>{_hrs(st['total_minutes'])}</b> ساعة")
+    lines.append(f"🧾 تسجيلات: {st['entries']}  (منها صور مقروءة: {st['screenshots']})")
+    lines.append(f"🔥 نشطين آخر ٧ أيام: {st['active7']} · آخر ٣٠ يوم: {st['active30']}")
+    if st["best_day"]:
+        d, m = st["best_day"]
+        lines.append(f"🏆 أعلى يوم: {d.isoformat()} — {_hrs(m)} ساعة")
+    if st["best_week"]:
+        w, m = st["best_week"]
+        lines.append(f"🏆 أعلى أسبوع: يبدأ {w.isoformat()} — {_hrs(m)} ساعة")
+    if st["best_month"]:
+        mo, m = st["best_month"]
+        lines.append(f"🏆 أعلى شهر: {mo} — {_hrs(m)} ساعة")
+    lines.append(f"📅 أطول سلسلة أيام متتالية: {st['longest_streak']} يوم")
+    if st["levels"]:
+        order = [t for _, t in LEVEL_TITLES]
+        lines.append("🎖️ المستويات: " + " · ".join(f"{t} {st['levels'][t]}" for t in order if t in st["levels"]))
+    lines.append(f"🏅 أسابيع في لوحة الشرف: {st['weeks_of_fame']}")
+    h = st["host"]
+    if h:
+        lines.append("")
+        lines.append(f"🤝 الغرف التلقائية (منذ {h.get('since', '?')}):")
+        lines.append(
+            f"   غرف نزلت: {h.get('rooms_posted', 0)} · جلسات بدأت: {h.get('sessions_started', 0)}"
+            f" · مشاركين: {h.get('participants', 0)} · ساعات المشاركين: {_hrs(int(h.get('participant_minutes', 0)))}"
+        )
+    lines.append("")
+    lines.append("📝 <b>CV line</b> (English):")
+    since = st["launch"] or "launch"
+    lines.append(
+        f"<code>Founded and built a study-tracking platform used by {st['registered']} KAU medical students "
+        f"across {len(st['per_batch'])} batches, logging {_hrs(st['total_minutes'])} study hours since {since}.</code>"
+    )
+    return "\n".join(lines)
+
+
+async def cmd_impact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/impact — manager-only, private chat. Whole-community totals for
+    reports / Husain's CV. Aggregates only, no names."""
+    user = update.effective_user
+    if MANAGER_IDS and user.id not in MANAGER_IDS:
+        await update.message.reply_text("هذا الأمر مخصص للمنظّمين فقط.")
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("أرسل /impact للبوت بالخاص.")
+        return
+    st = await asyncio.to_thread(impact_stats)
+    await update.message.reply_text(impact_text(st), parse_mode="HTML")
+
+
 async def cmd_backupnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/backupnow — manager-only, private chat. Runs the daily backup right
     away and says whether it worked (and why not), so the private-repo
@@ -3881,6 +4028,19 @@ def _persist_room(context, key: str, **changes):
     return room
 
 
+def _bump_autohost_stats(**inc):
+    """All-time auto-host counters for /impact (the per-day room state is
+    overwritten every day, so history needs its own settings key)."""
+    try:
+        stats = json.loads(get_setting("autohost_stats") or "{}")
+    except ValueError:
+        stats = {}
+    stats.setdefault("since", local_today().isoformat())
+    for k, v in inc.items():
+        stats[k] = int(stats.get(k, 0)) + int(v or 0)
+    set_setting("autohost_stats", json.dumps(stats))
+
+
 async def _auto_host_create(context, key: str, start: datetime, end: datetime, minutes: int):
     res = await agent_call("create_room", timeout=180, minutes=minutes)
     code = str(res.get("code") or "")
@@ -3918,6 +4078,7 @@ async def _auto_host_post(context, key: str):
         **_topic_kwargs(TOPIC_SESSIONS_ID),
     )
     _persist_room(context, key, state="open", msg_id=msg.message_id)
+    _bump_autohost_stats(rooms_posted=1)
 
 
 async def _auto_host_start(context, key: str, attempt: int):
@@ -3928,6 +4089,9 @@ async def _auto_host_start(context, key: str, attempt: int):
         return
     if res.get("ok") and res.get("started"):
         _persist_room(context, key, state="started", members=res.get("members"))
+        joined = int(res.get("members") or 0)  # people who joined (the host account isn't counted)
+        _bump_autohost_stats(sessions_started=1, participants=joined,
+                             participant_minutes=joined * int(room.get("minutes") or 0))
         sched = _get_today_schedule(context)
         sched.setdefault("link_sent", set()).add(key)  # lets the block auto-tick ✅ when it ends
         _save_schedule_state(sched)
@@ -4393,6 +4557,7 @@ def main():
     app.add_handler(CommandHandler("mycard", cmd_mycard))
     app.add_handler(CommandHandler("mylink", cmd_mylink))
     app.add_handler(CommandHandler("backupnow", cmd_backupnow))
+    app.add_handler(CommandHandler("impact", cmd_impact))
     app.add_handler(CommandHandler("autohost", cmd_autohost))
     app.add_handler(CommandHandler("testroom", cmd_testroom))
     app.add_handler(CommandHandler("compare", cmd_compare))
