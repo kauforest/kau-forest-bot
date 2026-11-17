@@ -12,9 +12,16 @@ What it does:
       close_room()         -> Exit Room -> Exit
   * After a session ends it taps Continue -> All Done so it's ready again.
 
+  * Self-healing (v3): every few minutes it checks that BlueStacks answers and
+    has internet. If BlueStacks froze or lost its network, it restarts it on
+    its own (never during a running session) and reopens Forest.
+
 Run:   python host_agent.py
 Test:  python host_agent.py --selftest     (opens a 10-min room, prints the code, closes it)
        python host_agent.py --screen       (prints what screen Forest is on)
+       python host_agent.py --health       (checks BlueStacks + internet, changes nothing)
+       python host_agent.py --heal         (restarts BlueStacks now and waits until it's ready)
+       python host_agent.py --install-startup  (start this helper automatically when Windows logs in)
 
 Needs: BlueStacks 5 open with ADB on, and `pip install websockets`.
 """
@@ -32,7 +39,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 BOT_WS_URL = os.environ.get("FOREST_BOT_WS", "wss://kau-forest-bot-production.up.railway.app")
-VERSION = 2
+VERSION = 3
 
 ADB_CANDIDATES = [
     (r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe", "127.0.0.1:5555"),
@@ -40,6 +47,14 @@ ADB_CANDIDATES = [
 ]
 ADB, DEVICE = next(((p, d) for p, d in ADB_CANDIDATES if os.path.exists(p)), ADB_CANDIDATES[0])
 PKG = "cc.forestapp"
+BS_DIR = os.path.dirname(ADB)
+HD_PLAYER = os.path.join(BS_DIR, "HD-Player.exe")
+BS_CONF_CANDIDATES = [r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf", r"C:\ProgramData\BlueStacks\bluestacks.conf"]
+
+HEAL_CHECK_EVERY = 300        # watchdog looks at BlueStacks every 5 min
+HEAL_MIN_GAP = 10 * 60        # never restart BlueStacks more often than this…
+HEAL_NET_MIN_GAP = 2 * 3600   # …and for "no internet" at most every 2 h (a restart may not fix e.g. a firewall)
+BOOT_WAIT = 240               # how long to wait for Android to finish booting after a restart
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SECRET_FILE = os.path.join(HERE, "secret.txt")
@@ -97,10 +112,55 @@ def adb(*args, timeout=40, binary=False):
     return r.stdout if binary else (r.stdout + r.stderr).decode("utf-8", "replace")
 
 
+def _adb_connect_once() -> str:
+    try:
+        return subprocess.run([ADB, "connect", DEVICE], capture_output=True, text=True, timeout=20).stdout
+    except subprocess.TimeoutExpired:
+        return "timeout"
+
+
 def adb_connect():
-    out = subprocess.run([ADB, "connect", DEVICE], capture_output=True, text=True, timeout=20).stdout
+    if HEALER.busy:
+        raise ForestError("BlueStacks is restarting right now — try again in a minute")
+    out = _adb_connect_once()
     if "connected" not in out:
-        raise ForestError(f"can't reach BlueStacks ({out.strip()[:80]}). Is BlueStacks 5 open with ADB on?")
+        subprocess.run([ADB, "disconnect", DEVICE], capture_output=True, timeout=20)
+        time.sleep(2)
+        out = _adb_connect_once()
+    if "connected" not in out:
+        HEALER.request("ADB can't reach BlueStacks")
+        raise ForestError(f"can't reach BlueStacks ({out.strip()[:80]}) — restarting BlueStacks")
+
+
+def android_ready() -> bool:
+    """Android inside BlueStacks has finished booting and answers commands."""
+    try:
+        return adb("shell", "getprop", "sys.boot_completed", timeout=15).strip().endswith("1")
+    except ForestError:
+        return False
+
+
+PING_SEEN_OK = False  # some emulator networks drop ping entirely; only trust a "no" once a "yes" was seen
+
+
+def has_internet() -> bool | None:
+    """True/False if Android can reach the internet; None if we can't tell."""
+    global PING_SEEN_OK
+    try:
+        out = adb("shell", "ping -c 1 -W 4 1.1.1.1 || ping -c 1 -W 4 8.8.8.8", timeout=20)
+    except ForestError:
+        return None
+    if " 0% packet loss" in out or "1 received" in out:
+        PING_SEEN_OK = True
+        return True
+    if "100% packet loss" in out or "unreachable" in out.lower() or "0 received" in out:
+        return False if PING_SEEN_OK else None
+    return None
+
+
+def room_recently_opened(minutes=20) -> bool:
+    t = load_state().get("room_created_at")
+    return bool(t) and datetime.now() - datetime.fromisoformat(t) < timedelta(minutes=minutes)
 
 
 def tap(x, y, pause=1.5):
@@ -207,6 +267,10 @@ def classify() -> str:
     texts = " | ".join(n["text"] for n in nodes)
     if "All Done" in texts:
         return "all_done"
+    if "No Internet Connection" in texts:
+        return "no_internet_dialog"
+    if "Something went wrong" in texts:
+        return "error_dialog"
     if "at least 2 people" in texts:
         return "need_two_dialog"
     if "Exit the room?" in texts:
@@ -244,8 +308,12 @@ def tidy(max_steps=6) -> str:
         nodes = dump()
         if state == "all_done":
             tap(*center(find(nodes, text="All Done")))
-        elif state == "need_two_dialog":
-            tap(*center(find(nodes, text="OK")))
+        elif state in ("need_two_dialog", "no_internet_dialog", "error_dialog"):
+            ok = find(nodes, text="OK")
+            if ok:
+                tap(*center(ok))
+            else:
+                back()
         elif state == "exit_dialog":
             tap(*center(find(nodes, text="Cancel")))
         elif state == "end_screen":
@@ -321,20 +389,30 @@ def cmd_create_room(minutes: int) -> dict:
         raise ForestError("Create Room button not found")
     tap(*center(create), pause=4)
     code = None
+    net_error = False
     for _ in range(8):
-        n = find(dump(), contains="Room code")
+        nodes = dump()
+        n = find(nodes, contains="Room code")
         if n:
             m = re.search(r"Room code\s+([A-Z0-9]{6,12})", n["text"])
             if m:
                 code = m.group(1)
                 break
+        if find(nodes, contains="Something went wrong") or find(nodes, contains="No Internet"):
+            net_error = True
+            break
         time.sleep(2)
     if not code:
+        tidy()
+        if net_error or has_internet() is False:
+            HEALER.request("Forest couldn't reach its server", network=True)
+            raise ForestError("BlueStacks has no internet — Forest couldn't create the room (restarting BlueStacks)")
         raise ForestError("room code didn't appear")
     back(pause=2.5)
     if classify() != "room_home":
         tidy()
-    save_state(room_code=code, room_minutes=int(minutes), session_until=None)
+    save_state(room_code=code, room_minutes=int(minutes), session_until=None,
+               room_created_at=datetime.now().isoformat())
     log.info("room created: %s (%s min)", code, minutes)
     return {"code": code}
 
@@ -424,9 +502,164 @@ def cmd_close_room() -> dict:
 def cmd_status() -> dict:
     try:
         adb_connect()
-        return {"screen": classify(), "session_running": session_running()}
+        return {"screen": classify(), "session_running": session_running(), "internet": has_internet()}
     except ForestError as e:
         return {"screen": "error", "error": str(e)}
+
+
+# ---------------------------------------------------------------- self-healing
+def _bluestacks_instance() -> str | None:
+    """The Android 11 instance name from bluestacks.conf (e.g. Rvc64)."""
+    if os.environ.get("BLUESTACKS_INSTANCE"):
+        return os.environ["BLUESTACKS_INSTANCE"]
+    for conf in BS_CONF_CANDIDATES:
+        try:
+            with open(conf, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        names = sorted(set(re.findall(r'^bst\.instance\.([A-Za-z0-9_]+)\.', text, re.M)))
+        for want in ("Rvc64", "Rvc"):
+            for n in names:
+                if n.startswith(want):
+                    return n
+        if names:
+            return names[0]
+    return None
+
+
+def kill_bluestacks():
+    for exe in ("HD-Player.exe",):
+        subprocess.run(["taskkill", "/F", "/IM", exe], capture_output=True, timeout=30)
+    time.sleep(6)
+
+
+def launch_bluestacks():
+    inst = _bluestacks_instance()
+    args = [HD_PLAYER] + (["--instance", inst] if inst else [])
+    log.info("starting BlueStacks: %s", " ".join(args))
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen(args, cwd=BS_DIR, creationflags=flags, close_fds=True)
+
+
+def bluestacks_running() -> bool:
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq HD-Player.exe"], capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return True  # can't tell — don't act on it
+    return "HD-Player.exe" in out
+
+
+class Healer:
+    """Restarts BlueStacks when it froze or lost its internet. Runs restarts in
+    the background so a bot command never waits minutes; the bot just retries."""
+
+    def __init__(self):
+        self.busy = False
+        self.last_heal = 0.0
+        self.last_net_heal = 0.0
+        self._lock = threading.Lock()
+
+    def can_heal(self, network=False) -> bool:
+        now = time.time()
+        if session_running():
+            return False
+        if now - self.last_heal < HEAL_MIN_GAP:
+            return False
+        if network and now - self.last_net_heal < HEAL_NET_MIN_GAP:
+            return False
+        return True
+
+    def request(self, reason: str, network=False):
+        if self.busy or not self.can_heal(network):
+            return False
+        threading.Thread(target=self.heal, args=(reason, network), daemon=True).start()
+        return True
+
+    def heal(self, reason: str, network=False) -> bool:
+        with self._lock:
+            if self.busy:
+                return False
+            self.busy = True
+            self.last_heal = time.time()
+            if network:
+                self.last_net_heal = self.last_heal
+        log.warning("restarting BlueStacks — %s", reason)
+        try:
+            kill_bluestacks()
+            launch_bluestacks()
+            deadline = time.time() + BOOT_WAIT
+            ok = False
+            while time.time() < deadline:
+                time.sleep(10)
+                if "connected" in _adb_connect_once() and android_ready():
+                    ok = True
+                    break
+            if not ok:
+                log.error("BlueStacks didn't come back within %ss", BOOT_WAIT)
+                return False
+            time.sleep(15)  # let the launcher settle
+            adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1")
+            time.sleep(10)
+            net = has_internet()
+            log.info("BlueStacks is back ✓ (internet: %s)", {True: "yes", False: "NO", None: "unknown"}[net])
+            return True
+        except Exception:
+            log.exception("restarting BlueStacks failed")
+            return False
+        finally:
+            self.busy = False
+
+    def check(self):
+        """One watchdog round. Only acts when idle (no command, no session)."""
+        if self.busy or session_running() or LOCK.locked():
+            return
+        if not bluestacks_running():
+            self.request("BlueStacks isn't open")
+            return
+        if "connected" not in _adb_connect_once() or not android_ready():
+            time.sleep(30)  # one more look before deciding it's frozen
+            if LOCK.locked() or session_running():
+                return
+            if "connected" not in _adb_connect_once() or not android_ready():
+                self.request("BlueStacks stopped answering (frozen?)")
+            return
+        if room_recently_opened():
+            return  # a room is waiting for people — never restart under it for a maybe-network issue
+        if has_internet() is False:
+            time.sleep(30)
+            if has_internet() is False and not LOCK.locked():
+                self.request("BlueStacks has no internet", network=True)
+
+
+HEALER = Healer()
+
+
+def watchdog_forever():
+    time.sleep(20)
+    while True:
+        try:
+            HEALER.check()
+        except Exception:
+            log.exception("watchdog round failed")
+        time.sleep(HEAL_CHECK_EVERY)
+
+
+def install_startup():
+    startup = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup")
+    if not os.path.isdir(startup):
+        print("Couldn't find the Windows Startup folder:", startup)
+        return
+    bat = os.path.join(startup, "forest_host_helper.bat")
+    with open(bat, "w", encoding="utf-8") as f:
+        f.write("@echo off\r\n")
+        f.write("title Forest auto-host helper\r\n")
+        f.write(f'cd /d "{HERE}"\r\n')
+        f.write("timeout /t 30 /nobreak >nul\r\n")  # give Windows + Wi-Fi a moment
+        f.write(f'"{sys.executable}" host_agent.py\r\n')
+    print("Done. The helper will now start by itself every time you log in to Windows:")
+    print("  ", bat)
+    print("(It also opens BlueStacks by itself if it isn't open.) To undo, delete that file.")
 
 
 LOCK = threading.Lock()
@@ -532,6 +765,20 @@ def main():
         open_forest()
         print("Forest screen:", classify())
         return
+    if "--install-startup" in sys.argv:
+        install_startup()
+        return
+    if "--health" in sys.argv:
+        print("BlueStacks open:", bluestacks_running())
+        print("ADB:", _adb_connect_once().strip()[:80])
+        print("Android ready:", android_ready())
+        print("Internet inside BlueStacks:", has_internet())
+        print("Instance:", _bluestacks_instance())
+        return
+    if "--heal" in sys.argv:
+        print("Restarting BlueStacks and waiting until it's ready (up to ~4 min)...")
+        print("OK ✓" if HEALER.heal("manual --heal") else "FAILED — see agent.log")
+        return
     if "--selftest" in sys.argv:
         print("Selftest: opening a 10-minute room...")
         r = run_action("create_room", {"minutes": 10})
@@ -541,6 +788,7 @@ def main():
             time.sleep(5)
             print("Closing it:", run_action("close_room", {}))
         return
+    threading.Thread(target=watchdog_forever, daemon=True).start()
     asyncio.run(serve_forever())
 
 
