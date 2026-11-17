@@ -39,7 +39,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 BOT_WS_URL = os.environ.get("FOREST_BOT_WS", "wss://kau-forest-bot-production.up.railway.app")
-VERSION = 3
+VERSION = 4
 
 ADB_CANDIDATES = [
     (r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe", "127.0.0.1:5555"),
@@ -325,6 +325,20 @@ def tidy(max_steps=6) -> str:
     return classify()
 
 
+def settled_screen(looks=5, gap=3) -> str:
+    """tidy(), but a "running" reading is only believed if it stays.
+    When WE haven't started a session, a dark bottom bar is usually a passing
+    overlay (someone joining, a toast, an animation) — on 2026-11-17 19:56 one
+    such moment made the helper give up on a room 3 s before it read fine."""
+    state = tidy()
+    while state == "running" and not session_running() and looks > 1:
+        looks -= 1
+        time.sleep(gap)
+        state = tidy()
+        log.info("re-look: %s", state)
+    return state
+
+
 def read_minutes(nodes) -> int | None:
     if find(nodes, text="Stopwatch"):
         return 0
@@ -364,7 +378,7 @@ def cmd_create_room(minutes: int) -> dict:
     if session_running():
         raise ForestError("a session is still running")
     open_forest()
-    state = tidy()
+    state = settled_screen()
     if state == "running":
         raise ForestError("a session is running in Forest")
     if state == "room_home":
@@ -436,11 +450,11 @@ def cmd_start_room() -> dict:
     if session_running():
         return {"started": True, "members": load_state().get("members")}
     open_forest()
-    state = tidy()
+    state = settled_screen()
     if state != "room_home":
         raise ForestError(f"no open room on screen ({state})")
     members = count_members()
-    if classify() != "room_home":   # safety: only ever tap Start on the room screen
+    if settled_screen(looks=3) != "room_home":   # safety: only ever tap Start on the room screen
         raise ForestError("left the room screen unexpectedly")
     tap(*ROOM_START, pause=3.5)
     nodes = dump()

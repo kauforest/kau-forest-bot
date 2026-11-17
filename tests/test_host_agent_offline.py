@@ -24,14 +24,14 @@ spec.loader.exec_module(H)
 PASSED = FAILED = 0
 
 
-def check(name, cond):
+def check(name, cond, detail=""):
     global PASSED, FAILED
     if cond:
         PASSED += 1
         print("  ✓", name)
     else:
         FAILED += 1
-        print("  ✗", name)
+        print("  ✗", name, detail)
 
 
 class FakeBlueStacks:
@@ -285,6 +285,34 @@ bat = os.path.join(startup, "forest_host_helper.bat")
 check("bat created", os.path.exists(bat))
 content = open(bat).read() if os.path.exists(bat) else ""
 check("bat starts host_agent.py from the helper folder", "host_agent.py" in content and H.HERE in content)
+
+print("\n[12] A passing dark overlay isn't mistaken for a running session")
+fresh()
+H.open_forest = lambda: None
+H.count_members = lambda: 1
+H.finish_session_later = lambda until: None  # real one runs in a thread later; inline it would wait on LOCK
+seq12 = iter(["running", "room_home", "room_home", "room_home"])
+H.tidy = lambda max_steps=6: next(seq12, "room_home")
+H.classify = lambda: "running" if taps12 else "room_home"
+taps12 = []
+H.tap = lambda x, y, pause=1.5: taps12.append((x, y))
+H.dump = lambda: []
+r = H.run_action("start_room", {})
+check("one 'running' glimpse, then the room → Start is pressed", r.get("ok") and r.get("started") and H.ROOM_START in taps12, str(r))
+fresh()
+H.tidy = lambda max_steps=6: "running"
+taps12.clear()
+r = H.run_action("start_room", {})
+check("a real running session (stays dark) → refuses, never taps", r["ok"] is False and "running" in r["error"] and not taps12, str(r))
+fresh()
+H.save_state(session_until=(datetime.now() + timedelta(minutes=30)).isoformat())
+looks = {"n": 0}
+def _t(max_steps=6):
+    looks["n"] += 1
+    return "running"
+H.tidy = _t
+H.settled_screen()
+check("during OUR session, 'running' is believed at once (no re-looks)", looks["n"] == 1)
 
 print(f"\n{PASSED} passed, {FAILED} failed")
 shutil.rmtree(TMP, ignore_errors=True)
