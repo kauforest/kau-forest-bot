@@ -90,6 +90,8 @@ class FakeBlueStacks:
         return types.SimpleNamespace(pid=1)
 
 
+ORIG_CLASSIFY = H.classify
+ORIG_TIDY = H.tidy
 BS = FakeBlueStacks()
 H.subprocess.run = BS.run
 H.subprocess.Popen = BS.popen
@@ -313,6 +315,46 @@ def _t(max_steps=6):
 H.tidy = _t
 H.settled_screen()
 check("during OUR session, 'running' is believed at once (no re-looks)", looks["n"] == 1)
+
+print("\n[13] Forest Plus ad after a session is closed, not mistaken for a session")
+
+
+def fake_img(bg=(21, 17, 42), bands=()):
+    w, h = 1080, 1920
+    raw = bytearray(16) + bytearray(bytes((*bg, 255)) * (w * h))
+    raw[0:4] = w.to_bytes(4, "little"); raw[4:8] = h.to_bytes(4, "little")
+    for (y1, y2, color) in bands:
+        line = bytes((*color, 255)) * w
+        for y in range(y1, y2):
+            i = 16 + y * w * 4
+            raw[i:i + w * 4] = line
+    return (w, h, 16, bytes(raw))
+
+
+promo_img = fake_img(bands=[(1778, 1852, (120, 238, 180))])
+running_img = fake_img(bg=(20, 40, 35))
+H.dump = lambda: []
+H.screen_pixels = lambda: promo_img
+H.classify = ORIG_CLASSIFY
+check("dark + wide coloured button → promo", H.classify() == "promo")
+H.screen_pixels = lambda: running_img
+check("plain dark screen → still 'running'", H.classify() == "running")
+end_img = fake_img(bands=[(1825, 1856, (255, 255, 255))])
+H.screen_pixels = lambda: end_img
+check("session end screen (white Continue) is not taken for the ad", H.classify() == "end_screen")
+ORIG_HOME_IMG = fake_img(bg=(90, 190, 150), bands=[(1825, 1855, (255, 255, 255))])
+H.screen_pixels = lambda: ORIG_HOME_IMG
+check("normal Forest home still reads 'home'", H.classify() == "home")
+fresh()
+taps13, backs13 = [], []
+shots = iter([promo_img, promo_img, ORIG_HOME_IMG])
+H.screen_pixels = lambda: next(shots, ORIG_HOME_IMG)
+H.tap = lambda x, y, pause=1.5: taps13.append((x, y))
+H.back = lambda: backs13.append(1)
+H.tidy = ORIG_TIDY
+st13 = H.tidy()
+check("tidy taps the ad's ⓧ (top-right), never the trial button", taps13 and taps13[0] == H.PROMO_CLOSE and all(y < 300 for _, y in taps13))
+check("…and ends on the home screen", st13 == "home", st13)
 
 print(f"\n{PASSED} passed, {FAILED} failed")
 shutil.rmtree(TMP, ignore_errors=True)

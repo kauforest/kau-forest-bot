@@ -39,7 +39,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 BOT_WS_URL = os.environ.get("FOREST_BOT_WS", "wss://kau-forest-bot-production.up.railway.app")
-VERSION = 4
+VERSION = 5
 
 ADB_CANDIDATES = [
     (r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe", "127.0.0.1:5555"),
@@ -246,6 +246,20 @@ def _bright_ratio(img, x1, y1, x2, y2):
     return hit / max(total, 1)
 
 
+def _vivid_ratio(img, x1, y1, x2, y2):
+    """Share of bright, coloured (not white) pixels — e.g. Forest Plus's
+    green→cyan "TRY 1 WEEK FOR FREE" button."""
+    total = hit = 0
+    for x in range(x1, x2, 4):
+        for y in range(y1, y2, 3):
+            r, g, b = _px(img, x, y)
+            total += 1
+            hit += g > 180 and min(r, b) < 170
+    return hit / max(total, 1)
+
+
+PROMO_CLOSE = (1040, 90)  # the grey ⓧ top-right of the Forest Plus ad (measured 2026-11-18)
+
 # ---------------------------------------------------------------- screen logic
 def forest_in_front() -> bool:
     out = adb("shell", "dumpsys window | grep mCurrentFocus")
@@ -286,6 +300,8 @@ def classify() -> str:
     exit_txt = _bright_ratio(img, 470, 1855, 610, 1885)
     cont_bar = _bright_ratio(img, 150, 1825, 930, 1855)
     room_bar = _bright_ratio(img, 150, 1755, 930, 1785)
+    if bg_g < 70 and _vivid_ratio(img, 150, 1790, 930, 1840) > 0.7:
+        return "promo"  # Forest Plus ad (dark, wide coloured button) — shown after a session on 2026-11-18
     if bg_g < 70 and cont_bar > 0.8:
         return "end_screen"
     if bg_g > 140 and exit_txt > 0.05 and room_bar > 0.8:
@@ -318,6 +334,12 @@ def tidy(max_steps=6) -> str:
             tap(*center(find(nodes, text="Cancel")))
         elif state == "end_screen":
             tap(*END_CONTINUE, pause=3)
+        elif state == "promo":
+            # Close the ad with its ⓧ (never the trial button); Back if that didn't do it.
+            close = find(nodes, desc="Close") or find(nodes, text="Close")
+            tap(*(center(close) if close else PROMO_CLOSE), pause=2)
+            if classify() == "promo":
+                back()
         elif state in ("sheet", "room_sheet"):
             back()
         else:
