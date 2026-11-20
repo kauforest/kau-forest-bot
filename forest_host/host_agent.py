@@ -39,7 +39,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 BOT_WS_URL = os.environ.get("FOREST_BOT_WS", "wss://kau-forest-bot-production.up.railway.app")
-VERSION = 5
+VERSION = 6
 
 ADB_CANDIDATES = [
     (r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe", "127.0.0.1:5555"),
@@ -254,7 +254,7 @@ def _vivid_ratio(img, x1, y1, x2, y2):
         for y in range(y1, y2, 3):
             r, g, b = _px(img, x, y)
             total += 1
-            hit += g > 180 and min(r, b) < 170
+            hit += g > 205 and min(r, b) < 170
     return hit / max(total, 1)
 
 
@@ -300,8 +300,11 @@ def classify() -> str:
     exit_txt = _bright_ratio(img, 470, 1855, 610, 1885)
     cont_bar = _bright_ratio(img, 150, 1825, 930, 1855)
     room_bar = _bright_ratio(img, 150, 1755, 930, 1785)
-    if bg_g < 70 and _vivid_ratio(img, 150, 1790, 930, 1840) > 0.7:
-        return "promo"  # Forest Plus ad (dark, wide coloured button) — shown after a session on 2026-11-18
+    if _vivid_ratio(img, 150, 1790, 930, 1840) > 0.7 and _vivid_ratio(img, 150, 1870, 930, 1910) < 0.2:
+        # Forest Plus ads (dark "Grow Your Inner Forest" 2026-11-18, teal "Keep Apps that Help
+        # You Focus Deeper" 2026-11-19): any background, but always the same wide
+        # green→cyan "TRY 1 WEEK FOR FREE" button as a band at y≈1780–1850.
+        return "promo"
     if bg_g < 70 and cont_bar > 0.8:
         return "end_screen"
     if bg_g > 140 and exit_txt > 0.05 and room_bar > 0.8:
@@ -371,12 +374,25 @@ def read_minutes(nodes) -> int | None:
     return None
 
 
+def ruler_y(nodes) -> int:
+    """The minute ruler sits ~73 px under the "N minute" label. Measured from
+    the label because the sheet moves: on 2026-11-19 Forest added a "Deep focus /
+    Customize allowed apps" block and the ruler went from y 1446 to ~1374."""
+    label = find(nodes, contains=" minute") or find(nodes, text="Stopwatch")
+    if not label:
+        return RULER_Y
+    y1, y2 = label["b"][1], label["b"][3]
+    return (y1 + y2) // 2 + 73
+
+
 def set_timer(target: int):
     """Opens the Timer sheet and moves its ruler until it reads `target` minute."""
     tap(*TIMER, pause=2.5)
     nodes = dump()
     if read_minutes(nodes) is None:
         raise ForestError("Timer sheet didn't open")
+    ry = ruler_y(nodes)
+    log.info("timer sheet: %s minute now, ruler at y=%d", read_minutes(nodes), ry)
     for _ in range(25):
         cur = read_minutes(nodes)
         if cur == target:
@@ -388,9 +404,9 @@ def set_timer(target: int):
         if px == 0:
             px = 30 if target > cur_eff else -30
         if px > 0:
-            swipe(700, 700 - px, RULER_Y, 1200)   # left = more minutes
+            swipe(700, 700 - px, ry, 1200)   # left = more minutes
         else:
-            swipe(380, 380 - px, RULER_Y, 1200)   # right = fewer minutes
+            swipe(380, 380 - px, ry, 1200)   # right = fewer minutes
         nodes = dump()
     raise ForestError(f"couldn't set the timer to {target} (stuck at {read_minutes(nodes)})")
 

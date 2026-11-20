@@ -91,6 +91,7 @@ class FakeBlueStacks:
 
 
 ORIG_CLASSIFY = H.classify
+ORIG_SET_TIMER = H.set_timer
 ORIG_TIDY = H.tidy
 BS = FakeBlueStacks()
 H.subprocess.run = BS.run
@@ -355,6 +356,32 @@ H.tidy = ORIG_TIDY
 st13 = H.tidy()
 check("tidy taps the ad's ⓧ (top-right), never the trial button", taps13 and taps13[0] == H.PROMO_CLOSE and all(y < 300 for _, y in taps13))
 check("…and ends on the home screen", st13 == "home", st13)
+
+print("\n[14] Teal Forest Plus ad (2026-11-19) and the moved timer ruler")
+teal_ad = fake_img(bg=(100, 166, 162), bands=[(1778, 1852, (88, 223, 208))])
+H.screen_pixels = lambda: teal_ad
+H.dump = lambda: []
+H.classify = ORIG_CLASSIFY
+check("teal ad with the trial button → promo", H.classify() == "promo")
+real_home = fake_img(bg=(21, 147, 123), bands=[(1795, 1850, (255, 255, 255))])
+H.screen_pixels = lambda: real_home
+check("real home colours (measured) are not taken for an ad", H.classify() != "promo")
+old_label = [{"text": "60 minute", "desc": "", "click": False, "b": (427, 1344, 654, 1402)}]
+new_label = [{"text": "60 minute", "desc": "", "click": False, "b": (427, 1270, 654, 1328)}]
+check("old sheet layout → ruler at 1446 (as measured 2026-11-15)", H.ruler_y(old_label) == 1446)
+check("new sheet with Deep focus block → ruler moves up with the label", H.ruler_y(new_label) == 1372)
+check("no label → falls back to the old position", H.ruler_y([]) == H.RULER_Y)
+swipes14 = []
+state14 = {"m": 60}
+H.tap = lambda x, y, pause=1.5: None
+def _swipe(x1, x2, y, ms=1200):
+    swipes14.append(y)
+    if abs(y - 1372) < 20:          # only a swipe on the real ruler moves it
+        state14["m"] += 5 if x2 < x1 else -5
+H.swipe = _swipe
+H.dump = lambda: [{"text": f"{state14['m']} minute", "desc": "", "click": False, "b": (427, 1270, 654, 1328)}]
+ORIG_SET_TIMER(90)
+check("set_timer reaches 90 by swiping where the ruler really is", state14["m"] == 90 and all(abs(y - 1372) < 20 for y in swipes14), f"{state14['m']} via y={set(swipes14)}")
 
 print(f"\n{PASSED} passed, {FAILED} failed")
 shutil.rmtree(TMP, ignore_errors=True)
